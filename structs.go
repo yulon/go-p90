@@ -3,9 +3,9 @@ package p90
 const mgcNum uint16 = 0x9050
 
 type baseHeader struct {
-	mgcNum uint16
-	hash   uint32
-	typ    uint8
+	MgcNum uint16
+	Hash   uint32
+	Type   uint8
 }
 
 //var baseHeaderSz int = binary.Size(baseHeader{})
@@ -18,42 +18,21 @@ type typeLessBaseHeader struct {
 
 const typeLessBaseHeaderSz int = 6
 
+const typeByteIndex int = 6
+
 const (
 	basicPacket byte = iota
 	reliablePacket
 	reliablePacketResponse
-	softPacket
-	hardPacket
-	hardPacketsRequest
-	latestHardPacketCountRequest
-	latestHardPacketCountResponse
 )
 
 type basicPacketHeader struct{}
 
-type softPacketHeader struct {
-	LatestHardPacketC uint32
-}
-
-type hardPacketHeader struct {
-	HardPacketC uint32
-}
-
-type hardPacketsRequestHeader struct {
-	HardPacketCList []uint32
-}
-
 type reliablePacketHeader struct {
-	ReliablePacketID uint64
+	ReliablePacketID uint32
 }
 
 type reliablePacketResponseHeader struct {
-	ReceivedReliablePacketID uint64
-}
-
-type latestHardPacketCountRequestHeader reliablePacketHeader
-
-type latestHardPacketCountResponseHeader struct {
-	ReceivedReliablePacketID uint64
-	LatestHardPacketC        uint32
+	ReceivedReliablePacketID   uint32
+	ReceivedReliablePacketHash uint32
 }
