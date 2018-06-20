@@ -8,13 +8,6 @@ import (
 	"sync/atomic"
 )
 
-/*type sharedValidBlock struct {
-	useCount uint64
-	data     []byte
-}
-
-var validBlockMap sync.Map*/
-
 type hashedValidBlock struct {
 	hash uint32
 	data []byte
@@ -62,7 +55,7 @@ func validBlockSz(data []byte, h uint32) int {
 	var hash uint32
 	for i := 0; i < len(data) && i < 521; i++ {
 		hash = hash*seed + uint32(data[i])
-		if hash == h {
+		if hash&0x7FFFFFFF == h {
 			return i + 1
 		}
 	}
@@ -229,38 +222,6 @@ func (s *Session) Listen() {
 				c = v.(*conn)
 
 				c.rpMap.Delete(secHeader.ReceivedReliablePacketID)
-
-				/*
-					case softPacket:
-							var secHeader softPacketHeader
-							secHeaderSz := binary.Size(secHeader)
-
-							validBlock := udpPkt[baseHeaderSz:pktSz]
-							buf := bytes.NewReader(validBlock)
-							binary.Read(buf, binary.LittleEndian, &secHeader)
-
-							// ck hard
-
-							if pktSz == baseHeaderSz+secHeaderSz {
-								return
-							}
-							s.receiver(addr, validBlock[secHeaderSz:])
-
-					case hardPacket:
-							var secHeader hardPacketHeader
-							secHeaderSz := binary.Size(secHeader)
-
-							validBlock := udpPkt[baseHeaderSz:pktSz]
-							buf := bytes.NewReader(validBlock)
-							binary.Read(buf, binary.LittleEndian, &secHeader)
-
-							// d hard que
-
-							if pktSz == baseHeaderSz+secHeaderSz {
-								return
-							}
-							s.receiver(addr, validBlock[secHeaderSz:])
-				*/
 			}
 		}()
 	}
