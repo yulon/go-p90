@@ -43,7 +43,7 @@ func NewSession(addr string, receiver func(addr *net.UDPAddr, data []byte)) (*Se
 
 func bkdr(data []byte) uint32 {
 	var seed uint32 = 131
-	var hash uint32
+	var hash uint32 = 1
 	for i := 0; i < len(data); i++ {
 		hash = hash*seed + uint32(data[i])
 	}
@@ -52,7 +52,7 @@ func bkdr(data []byte) uint32 {
 
 func validBlockSz(data []byte, h uint32) int {
 	var seed uint32 = 131
-	var hash uint32
+	var hash uint32 = 1
 	for i := 0; i < len(data) && i < 521; i++ {
 		hash = hash*seed + uint32(data[i])
 		if hash&0x7FFFFFFF == h {
