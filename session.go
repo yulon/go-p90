@@ -70,9 +70,15 @@ func validBlockSz(data []byte, h uint32) int {
 }
 
 func (s *Session) sendHashedValidBlock(addr *net.UDPAddr, hash uint32, validBlock []byte) {
-	pktBuf := bytes.NewBuffer([]byte{'P', 0x90})
-	binary.Write(pktBuf, binary.LittleEndian, hash)
+	pktBuf := bytes.NewBuffer([]byte{})
+
+	binary.Write(pktBuf, binary.LittleEndian, typeLessBaseHeader{
+		mgcNum,
+		hash,
+	})
+
 	pktBuf.Write(validBlock)
+
 	s.udpConn.WriteToUDP(pktBuf.Bytes(), addr)
 }
 
@@ -81,19 +87,16 @@ func (s *Session) sendValidBlock(addr *net.UDPAddr, validBlock []byte) {
 }
 
 func (s *Session) Send(addr *net.UDPAddr, data []byte) {
-	validBlockBuf := bytes.NewBuffer([]byte{basicPacket})
-
-	binary.Write(validBlockBuf, binary.LittleEndian, softPacketHeader{
-		0,
-	})
-
+	validBlockBuf := bytes.NewBuffer([]byte{})
+	validBlockBuf.WriteByte(basicPacket)
 	validBlockBuf.Write(data)
 
 	s.sendValidBlock(addr, validBlockBuf.Bytes())
 }
 
 func (s *Session) ReliableSend(addr *net.UDPAddr, data []byte) { // unfinished
-	validBlockBuf := bytes.NewBuffer([]byte{reliablePacket})
+	validBlockBuf := bytes.NewBuffer([]byte{})
+	validBlockBuf.WriteByte(reliablePacket)
 
 	c := &conn{}
 	v, loaded := s.connMap.LoadOrStore(addr.String(), c)
@@ -118,7 +121,8 @@ func (s *Session) ReliableSend(addr *net.UDPAddr, data []byte) { // unfinished
 }
 
 func (s *Session) sendRpResp(addr *net.UDPAddr, receivedRpID uint64) {
-	validBlockBuf := bytes.NewBuffer([]byte{basicPacket})
+	validBlockBuf := bytes.NewBuffer([]byte{})
+	validBlockBuf.WriteByte(reliablePacketResponse)
 
 	binary.Write(validBlockBuf, binary.LittleEndian, reliablePacketResponseHeader{
 		receivedRpID,
@@ -135,11 +139,21 @@ func (s *Session) Listen() {
 			continue
 		}
 
-		buf := bytes.NewBuffer(cache[:typeLessBaseHeaderSz])
 		var tlBaseHeader typeLessBaseHeader
-		binary.Read(buf, binary.LittleEndian, tlBaseHeader)
 
-		if tlBaseHeader.mgcNum != mgcNum {
+		ok := false
+
+		for i := 0; i < udpPktSz-baseHeaderSz; i++ {
+			buf := bytes.NewReader(cache[i:])
+			binary.Read(buf, binary.LittleEndian, &tlBaseHeader)
+
+			if tlBaseHeader.MgcNum == mgcNum {
+				ok = true
+				break
+			}
+		}
+
+		if !ok {
 			continue
 		}
 
@@ -149,7 +163,7 @@ func (s *Session) Listen() {
 		go func() {
 			var c *conn
 
-			pktSz := validBlockSz(udpPkt[6:], tlBaseHeader.hash)
+			pktSz := validBlockSz(udpPkt[6:], tlBaseHeader.Hash)
 			if pktSz == 0 {
 				return
 			}
@@ -174,10 +188,10 @@ func (s *Session) Listen() {
 				}
 
 				validBlock := udpPkt[baseHeaderSz:pktSz]
-				buf := bytes.NewBuffer(validBlock)
-				binary.Read(buf, binary.LittleEndian, secHeader)
+				buf := bytes.NewReader(validBlock)
+				binary.Read(buf, binary.LittleEndian, &secHeader)
 
-				s.sendRpResp(addr, secHeader.reliablePacketID)
+				s.sendRpResp(addr, secHeader.ReliablePacketID)
 
 				c = &conn{}
 				v, loaded := s.connMap.LoadOrStore(addr.String(), c)
@@ -185,7 +199,7 @@ func (s *Session) Listen() {
 					c = v.(*conn)
 				}
 
-				v, loaded = c.rvRpMap.LoadOrStore(secHeader.reliablePacketID, true)
+				v, loaded = c.rvRpMap.LoadOrStore(secHeader.ReliablePacketID, true)
 				if loaded {
 					return
 				}
@@ -205,8 +219,8 @@ func (s *Session) Listen() {
 				}
 
 				validBlock := udpPkt[baseHeaderSz:pktSz]
-				buf := bytes.NewBuffer(validBlock)
-				binary.Read(buf, binary.LittleEndian, secHeader)
+				buf := bytes.NewReader(validBlock)
+				binary.Read(buf, binary.LittleEndian, &secHeader)
 
 				v, loaded := s.connMap.Load(addr.String())
 				if !loaded {
@@ -214,7 +228,7 @@ func (s *Session) Listen() {
 				}
 				c = v.(*conn)
 
-				c.rpMap.Delete(secHeader.receivedReliablePacketID)
+				c.rpMap.Delete(secHeader.ReceivedReliablePacketID)
 
 				/*
 					case softPacket:
@@ -222,8 +236,8 @@ func (s *Session) Listen() {
 							secHeaderSz := binary.Size(secHeader)
 
 							validBlock := udpPkt[baseHeaderSz:pktSz]
-							buf := bytes.NewBuffer(validBlock)
-							binary.Read(buf, binary.LittleEndian, secHeader)
+							buf := bytes.NewReader(validBlock)
+							binary.Read(buf, binary.LittleEndian, &secHeader)
 
 							// ck hard
 
@@ -237,8 +251,8 @@ func (s *Session) Listen() {
 							secHeaderSz := binary.Size(secHeader)
 
 							validBlock := udpPkt[baseHeaderSz:pktSz]
-							buf := bytes.NewBuffer(validBlock)
-							binary.Read(buf, binary.LittleEndian, secHeader)
+							buf := bytes.NewReader(validBlock)
+							binary.Read(buf, binary.LittleEndian, &secHeader)
 
 							// d hard que
 

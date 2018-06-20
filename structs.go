@@ -12,8 +12,8 @@ type baseHeader struct {
 const baseHeaderSz int = 7
 
 type typeLessBaseHeader struct {
-	mgcNum uint16
-	hash   uint32
+	MgcNum uint16
+	Hash   uint32
 }
 
 const typeLessBaseHeaderSz int = 6
@@ -32,28 +32,28 @@ const (
 type basicPacketHeader struct{}
 
 type softPacketHeader struct {
-	latestHardPacketC uint32
+	LatestHardPacketC uint32
 }
 
 type hardPacketHeader struct {
-	hardPacketC uint32
+	HardPacketC uint32
 }
 
 type hardPacketsRequestHeader struct {
-	hardPacketCList []uint32
+	HardPacketCList []uint32
 }
 
 type reliablePacketHeader struct {
-	reliablePacketID uint64
+	ReliablePacketID uint64
 }
 
 type reliablePacketResponseHeader struct {
-	receivedReliablePacketID uint64
+	ReceivedReliablePacketID uint64
 }
 
 type latestHardPacketCountRequestHeader reliablePacketHeader
 
 type latestHardPacketCountResponseHeader struct {
-	receivedReliablePacketID uint64
-	latestHardPacketC        uint32
+	ReceivedReliablePacketID uint64
+	LatestHardPacketC        uint32
 }
