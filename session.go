@@ -70,13 +70,14 @@ func Listen(addr string, receiver Receiver) error {
 }
 
 type Conn struct {
-	s    *Session
-	addr *net.UDPAddr
-	ctx  *connContext
+	s       *Session
+	addr    *net.UDPAddr
+	addrStr string
+	ctx     *connContext
 }
 
 func (s *Session) dial(addr *net.UDPAddr) *Conn {
-	return &Conn{s, addr, nil}
+	return &Conn{s, addr, "", nil}
 }
 
 func (s *Session) Dial(addr string) (*Conn, error) {
@@ -85,6 +86,13 @@ func (s *Session) Dial(addr string) (*Conn, error) {
 		return nil, err
 	}
 	return s.dial(udpAddr), nil
+}
+
+func (c *Conn) Addr() string {
+	if len(c.addrStr) == 0 {
+		c.addrStr = c.addr.String()
+	}
+	return c.addrStr
 }
 
 func (c *Conn) getOrNewCtx() {
