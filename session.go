@@ -9,21 +9,26 @@ import (
 	"time"
 )
 
-type rpInfo struct {
-	hash        uint16
+type reliablePacketCache struct {
 	ts          time.Time
-	isResponsed uint32
+	hash        uint16
+	pkt         []byte
+	isResponsed bool
 }
 
 type conn struct {
 	rpIDCount uint32
-	rpMap     sync.Map // map[rpID]*rpInfo
-	rvRpMap   sync.Map // map[rpID]interface{}
-	rtt       int64
+
+	rpMap       map[uint32]*reliablePacketCache
+	hasRtnsLoop bool
+	rtnsGrtMtx  sync.Mutex
+
+	rvRpMap sync.Map // map[rpID]interface{}
+	rtt     int64
 }
 
 func newConn() *conn {
-	return &conn{rtt: int64(time.Second)}
+	return &conn{rpMap: map[uint32]*reliablePacketCache{}, hasRtnsLoop: false, rtt: int64(time.Second)}
 }
 
 type Session struct {
@@ -104,29 +109,61 @@ func (s *Session) ReliableSend(addr *net.UDPAddr, data []byte) {
 	})
 	pktBuf.Write(data)
 
-	hash := writeHashAndRet(pktBuf)
-
-	rpi := &rpInfo{hash, ts, 0}
-	c.rpMap.Store(id, rpi)
-
+	hash :=
+		writeHashAndRet(pktBuf)
 	pkt := pktBuf.Bytes()
+
+	c.rtnsGrtMtx.Lock()
+
 	s.udpConn.WriteToUDP(pkt, addr)
 
-	go func() {
-		dur := time.Duration(atomic.LoadInt64(&c.rtt))
-		var sleeped time.Duration
-		for sleeped < time.Minute {
-			dur *= 2
-			time.Sleep(dur)
-			sleeped += dur
+	rpCache := &reliablePacketCache{ts, hash, pkt, false}
 
-			if atomic.LoadUint32(&rpi.isResponsed) == 1 {
+	c.rpMap[id] = rpCache
+
+	if c.hasRtnsLoop {
+		c.rtnsGrtMtx.Unlock()
+		return
+	}
+	c.hasRtnsLoop = true
+
+	go func() {
+		for {
+			var rpCache *reliablePacketCache
+
+			c.rtnsGrtMtx.Lock()
+
+			for _, rpCache = range c.rpMap {
+				break
+			}
+			if rpCache == nil {
+				c.hasRtnsLoop = false
+				c.rtnsGrtMtx.Unlock()
 				return
 			}
-			s.udpConn.WriteToUDP(pkt, addr)
+
+			c.rtnsGrtMtx.Unlock()
+
+			dur := time.Duration(atomic.LoadInt64(&c.rtt))
+			var sleeped time.Duration
+			for sleeped < time.Minute {
+				dur *= 2
+				time.Sleep(dur)
+				sleeped += dur
+
+				c.rtnsGrtMtx.Lock()
+				if rpCache.isResponsed {
+					c.rtnsGrtMtx.Unlock()
+					break
+				}
+				c.rtnsGrtMtx.Unlock()
+
+				s.udpConn.WriteToUDP(rpCache.pkt, addr)
+			}
 		}
-		c.rpMap.Delete(id)
 	}()
+
+	c.rtnsGrtMtx.Unlock()
 }
 
 func (s *Session) sendRpResp(addr *net.UDPAddr, receivedRpID uint32, receivedRpHash uint16) {
@@ -221,21 +258,25 @@ func (s *Session) Listen() {
 				}
 				c = v.(*conn)
 
-				v, loaded = c.rpMap.Load(rprHeader.ReceivedReliablePacketID)
+				c.rtnsGrtMtx.Lock()
+
+				rpCache, loaded := c.rpMap[rprHeader.ReceivedReliablePacketID]
 				if !loaded {
-					return
-				}
-				rpi := v.(*rpInfo)
-
-				if rpi.hash != rprHeader.ReceivedReliablePacketHash {
+					c.rtnsGrtMtx.Unlock()
 					return
 				}
 
-				c.rpMap.Delete(rprHeader.ReceivedReliablePacketID)
+				if rpCache.hash != rprHeader.ReceivedReliablePacketHash {
+					c.rtnsGrtMtx.Unlock()
+					return
+				}
 
-				atomic.StoreUint32(&rpi.isResponsed, 1)
+				rpCache.isResponsed = true
+				delete(c.rpMap, rprHeader.ReceivedReliablePacketID)
 
-				atomic.StoreInt64(&c.rtt, int64(time.Now().Sub(rpi.ts)))
+				atomic.StoreInt64(&c.rtt, int64(time.Now().Sub(rpCache.ts)))
+
+				c.rtnsGrtMtx.Unlock()
 			}
 		}()
 	}
