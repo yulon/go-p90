@@ -16,7 +16,7 @@ type reliablePacketCache struct {
 	isResponsed bool
 }
 
-type conn struct {
+type connContext struct {
 	rpIDCount uint32
 
 	rpMap       map[uint32]*reliablePacketCache
@@ -27,30 +27,81 @@ type conn struct {
 	rtt     int64
 }
 
-func newConn() *conn {
-	return &conn{rpMap: map[uint32]*reliablePacketCache{}, hasRtnsLoop: false, rtt: int64(time.Second)}
+func newConnContext() *connContext {
+	return &connContext{rpMap: map[uint32]*reliablePacketCache{}, hasRtnsLoop: false, rtt: int64(time.Second)}
 }
+
+type Receiver func(conn *Conn, data []byte)
 
 type Session struct {
-	udpConn  *net.UDPConn
-	connMap  sync.Map // map[string]*conn
-	receiver func(addr *net.UDPAddr, data []byte)
+	udpConn    *net.UDPConn
+	connCtxMap sync.Map // map[string]*connContext
+
+	receiver Receiver
+
+	closed chan bool
 }
 
-func NewSessionFromUDP(udpAddr *net.UDPAddr, receiver func(addr *net.UDPAddr, data []byte)) (*Session, error) {
+func newSession(udpAddr *net.UDPAddr, receiver Receiver) (*Session, error) {
 	udpConn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
 		return nil, err
 	}
-	return &Session{udpConn, sync.Map{}, receiver}, nil
+	s := &Session{udpConn, sync.Map{}, receiver, make(chan bool, 1)}
+	go s.listen()
+	return s, nil
 }
 
-func NewSession(addr string, receiver func(addr *net.UDPAddr, data []byte)) (*Session, error) {
+func NewSession(addr string, receiver Receiver) (*Session, error) {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err
 	}
-	return NewSessionFromUDP(udpAddr, receiver)
+	return newSession(udpAddr, receiver)
+}
+
+func Listen(addr string, receiver Receiver) error {
+	s, err := NewSession(addr, receiver)
+	if err != nil {
+		return err
+	}
+	s.WaitClose()
+	return nil
+}
+
+type Conn struct {
+	s    *Session
+	addr *net.UDPAddr
+	ctx  *connContext
+}
+
+func (s *Session) dial(addr *net.UDPAddr) *Conn {
+	return &Conn{s, addr, nil}
+}
+
+func (s *Session) Dial(addr string) (*Conn, error) {
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return s.dial(udpAddr), nil
+}
+
+func (c *Conn) getOrNewCtx() {
+	c.ctx = newConnContext()
+	v, loaded := c.s.connCtxMap.LoadOrStore(c.addr.String(), c.ctx)
+	if loaded {
+		c.ctx = v.(*connContext)
+	}
+}
+
+func (c *Conn) getCtx() bool {
+	v, loaded := c.s.connCtxMap.Load(c.addr.String())
+	if loaded {
+		c.ctx = v.(*connContext)
+		return true
+	}
+	return false
 }
 
 func bkdrHash(data []byte) uint16 {
@@ -82,27 +133,25 @@ func writeHashAndRet(pktBuf *bytes.Buffer) uint16 {
 	return hash
 }
 
-func (s *Session) Send(addr *net.UDPAddr, data []byte) {
+func (c *Conn) Send(data []byte) {
 	pktBuf := makeBaseHeader(basicPacket, len(data))
 
 	pktBuf.Write(data)
 
 	writeHash(pktBuf)
-	s.udpConn.WriteToUDP(pktBuf.Bytes(), addr)
+	c.s.udpConn.WriteToUDP(pktBuf.Bytes(), c.addr)
 }
 
-func (s *Session) ReliableSend(addr *net.UDPAddr, data []byte) {
+func (c *Conn) ReliableSend(data []byte) {
 	ts := time.Now()
 
 	pktBuf := makeBaseHeader(reliablePacket, reliablePacketHeaderSz+len(data))
 
-	c := newConn()
-	v, loaded := s.connMap.LoadOrStore(addr.String(), c)
-	if loaded {
-		c = v.(*conn)
+	if c.ctx == nil {
+		c.getOrNewCtx()
 	}
 
-	id := atomic.AddUint32(&c.rpIDCount, 1)
+	id := atomic.AddUint32(&c.ctx.rpIDCount, 1)
 
 	binary.Write(pktBuf, binary.LittleEndian, reliablePacketHeader{
 		id,
@@ -113,60 +162,60 @@ func (s *Session) ReliableSend(addr *net.UDPAddr, data []byte) {
 		writeHashAndRet(pktBuf)
 	pkt := pktBuf.Bytes()
 
-	c.rtnsGrtMtx.Lock()
+	c.ctx.rtnsGrtMtx.Lock()
 
-	s.udpConn.WriteToUDP(pkt, addr)
+	c.s.udpConn.WriteToUDP(pkt, c.addr)
 
 	rpCache := &reliablePacketCache{ts, hash, pkt, false}
 
-	c.rpMap[id] = rpCache
+	c.ctx.rpMap[id] = rpCache
 
-	if c.hasRtnsLoop {
-		c.rtnsGrtMtx.Unlock()
+	if c.ctx.hasRtnsLoop {
+		c.ctx.rtnsGrtMtx.Unlock()
 		return
 	}
-	c.hasRtnsLoop = true
+	c.ctx.hasRtnsLoop = true
 
 	go func() {
 		for {
 			var rpCache *reliablePacketCache
 
-			c.rtnsGrtMtx.Lock()
+			c.ctx.rtnsGrtMtx.Lock()
 
-			for _, rpCache = range c.rpMap {
+			for _, rpCache = range c.ctx.rpMap {
 				break
 			}
 			if rpCache == nil {
-				c.hasRtnsLoop = false
-				c.rtnsGrtMtx.Unlock()
+				c.ctx.hasRtnsLoop = false
+				c.ctx.rtnsGrtMtx.Unlock()
 				return
 			}
 
-			c.rtnsGrtMtx.Unlock()
+			c.ctx.rtnsGrtMtx.Unlock()
 
-			dur := time.Duration(atomic.LoadInt64(&c.rtt))
+			dur := time.Duration(atomic.LoadInt64(&c.ctx.rtt))
 			var sleeped time.Duration
 			for sleeped < time.Minute {
 				dur *= 2
 				time.Sleep(dur)
 				sleeped += dur
 
-				c.rtnsGrtMtx.Lock()
+				c.ctx.rtnsGrtMtx.Lock()
 				if rpCache.isResponsed {
-					c.rtnsGrtMtx.Unlock()
+					c.ctx.rtnsGrtMtx.Unlock()
 					break
 				}
-				c.rtnsGrtMtx.Unlock()
+				c.ctx.rtnsGrtMtx.Unlock()
 
-				s.udpConn.WriteToUDP(rpCache.pkt, addr)
+				c.s.udpConn.WriteToUDP(rpCache.pkt, c.addr)
 			}
 		}
 	}()
 
-	c.rtnsGrtMtx.Unlock()
+	c.ctx.rtnsGrtMtx.Unlock()
 }
 
-func (s *Session) sendRpResp(addr *net.UDPAddr, receivedRpID uint32, receivedRpHash uint16) {
+func (s *Session) respondRP(addr *net.UDPAddr, receivedRpID uint32, receivedRpHash uint16) {
 	pktBuf := makeBaseHeader(reliablePacketResponse, reliablePacketResponseHeaderSz)
 
 	binary.Write(pktBuf, binary.LittleEndian, reliablePacketResponseHeader{
@@ -178,7 +227,7 @@ func (s *Session) sendRpResp(addr *net.UDPAddr, receivedRpID uint32, receivedRpH
 	s.udpConn.WriteToUDP(pktBuf.Bytes(), addr)
 }
 
-func (s *Session) Listen() {
+func (s *Session) listen() {
 	buf := make([]byte, 512)
 	for {
 		udpPktSz, addr, err := s.udpConn.ReadFromUDP(buf)
@@ -197,8 +246,6 @@ func (s *Session) Listen() {
 		copy(pkt, buf)
 
 		go func() {
-			var c *conn
-
 			var hash uint16
 			dataEnd := pktSz - hashSz
 			binary.Read(bytes.NewReader(pkt[dataEnd:]), binary.LittleEndian, &hash)
@@ -212,7 +259,7 @@ func (s *Session) Listen() {
 				if pktSz == pktSzMin {
 					return
 				}
-				s.receiver(addr, pkt[baseHeaderSz:dataEnd])
+				s.receiver(s.dial(addr), pkt[baseHeaderSz:dataEnd])
 
 			case reliablePacket:
 				var rpHeader reliablePacketHeader
@@ -224,15 +271,12 @@ func (s *Session) Listen() {
 
 				binary.Read(bytes.NewReader(pkt[baseHeaderSz:]), binary.LittleEndian, &rpHeader)
 
-				s.sendRpResp(addr, rpHeader.ReliablePacketID, hash)
+				s.respondRP(addr, rpHeader.ReliablePacketID, hash)
 
-				c = newConn()
-				v, loaded := s.connMap.LoadOrStore(addr.String(), c)
-				if loaded {
-					c = v.(*conn)
-				}
+				c := s.dial(addr)
+				c.getOrNewCtx()
 
-				v, loaded = c.rvRpMap.LoadOrStore(rpHeader.ReliablePacketID, true)
+				_, loaded := c.ctx.rvRpMap.LoadOrStore(rpHeader.ReliablePacketID, true)
 				if loaded {
 					return
 				}
@@ -240,7 +284,7 @@ func (s *Session) Listen() {
 				if pktSz == headersSz+hashSz {
 					return
 				}
-				s.receiver(addr, pkt[baseHeaderSz:dataEnd])
+				s.receiver(c, pkt[baseHeaderSz:dataEnd])
 
 			case reliablePacketResponse:
 				var rprHeader reliablePacketResponseHeader
@@ -252,32 +296,37 @@ func (s *Session) Listen() {
 
 				binary.Read(bytes.NewReader(pkt[baseHeaderSz:]), binary.LittleEndian, &rprHeader)
 
-				v, loaded := s.connMap.Load(addr.String())
-				if !loaded {
+				c := s.dial(addr)
+				if !c.getCtx() {
 					return
 				}
-				c = v.(*conn)
 
-				c.rtnsGrtMtx.Lock()
+				c.ctx.rtnsGrtMtx.Lock()
 
-				rpCache, loaded := c.rpMap[rprHeader.ReceivedReliablePacketID]
+				rpCache, loaded := c.ctx.rpMap[rprHeader.ReceivedReliablePacketID]
 				if !loaded {
-					c.rtnsGrtMtx.Unlock()
+					c.ctx.rtnsGrtMtx.Unlock()
 					return
 				}
 
 				if rpCache.hash != rprHeader.ReceivedReliablePacketHash {
-					c.rtnsGrtMtx.Unlock()
+					c.ctx.rtnsGrtMtx.Unlock()
 					return
 				}
 
 				rpCache.isResponsed = true
-				delete(c.rpMap, rprHeader.ReceivedReliablePacketID)
+				delete(c.ctx.rpMap, rprHeader.ReceivedReliablePacketID)
 
-				atomic.StoreInt64(&c.rtt, int64(time.Now().Sub(rpCache.ts)))
+				atomic.StoreInt64(&c.ctx.rtt, int64(time.Now().Sub(rpCache.ts)))
 
-				c.rtnsGrtMtx.Unlock()
+				c.ctx.rtnsGrtMtx.Unlock()
 			}
 		}()
 	}
+	s.closed <- true
+}
+
+func (s *Session) WaitClose() {
+	<-s.closed
+	s.closed <- true
 }
