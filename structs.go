@@ -1,24 +1,20 @@
 package p90
 
-const mgcNum uint16 = 0x9050
+const mgcNumValue uint16 = 0x9050
 
 type baseHeader struct {
 	MgcNum uint16
-	Hash   uint32
 	Type   uint8
+	Size   uint16
 }
 
-//var baseHeaderSz int = binary.Size(baseHeader{})
-const baseHeaderSz int = 7
+const baseHeaderSz int = 5
 
-type typeLessBaseHeader struct {
-	MgcNum uint16
-	Hash   uint32
-}
+const typeIndex int = 2
 
-const typeLessBaseHeaderSz int = 6
+const hashSz int = 2
 
-const typeByteIndex int = 6
+const pktSzMin int = baseHeaderSz + hashSz
 
 const (
 	basicPacket byte = iota
@@ -32,7 +28,11 @@ type reliablePacketHeader struct {
 	ReliablePacketID uint32
 }
 
+const reliablePacketHeaderSz int = 4
+
 type reliablePacketResponseHeader struct {
 	ReceivedReliablePacketID   uint32
-	ReceivedReliablePacketHash uint32
+	ReceivedReliablePacketHash uint16
 }
+
+const reliablePacketResponseHeaderSz int = 6

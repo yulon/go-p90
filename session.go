@@ -10,7 +10,7 @@ import (
 )
 
 type rpInfo struct {
-	hash        uint32
+	hash        uint16
 	ts          time.Time
 	isResponsed uint32
 }
@@ -48,57 +48,48 @@ func NewSession(addr string, receiver func(addr *net.UDPAddr, data []byte)) (*Se
 	return NewSessionFromUDP(udpAddr, receiver)
 }
 
-func bkdr(data []byte) uint32 {
-	var seed uint32 = 131
-	var hash uint32 = 1
+func bkdr(data []byte) uint16 {
+	var seed uint64 = 131
+	var hash uint64 = 1
 	for i := 0; i < len(data); i++ {
-		hash = hash*seed + uint32(data[i])
+		hash = hash*seed + uint64(data[i])
 	}
-	return hash & 0x7FFFFFFF
+	return uint16(hash % 65535)
 }
 
-func validBlockSz(data []byte, h uint32) int {
-	var seed uint32 = 131
-	var hash uint32 = 1
-	for i := 0; i < len(data) && i < 521; i++ {
-		hash = hash*seed + uint32(data[i])
-		if hash&0x7FFFFFFF == h {
-			return i + 1
-		}
-	}
-	return 0
-}
-
-func (s *Session) sendHashedValidBlock(addr *net.UDPAddr, hash uint32, validBlock []byte) {
+func makeBaseHeader(typ uint8, secHeaderAndBodySz int) *bytes.Buffer {
 	pktBuf := bytes.NewBuffer([]byte{})
-
-	binary.Write(pktBuf, binary.LittleEndian, typeLessBaseHeader{
-		mgcNum,
-		hash,
+	binary.Write(pktBuf, binary.LittleEndian, baseHeader{
+		mgcNumValue,
+		typ,
+		uint16(baseHeaderSz + secHeaderAndBodySz + hashSz),
 	})
-
-	pktBuf.Write(validBlock)
-
-	s.udpConn.WriteToUDP(pktBuf.Bytes(), addr)
+	return pktBuf
 }
 
-func (s *Session) sendValidBlock(addr *net.UDPAddr, validBlock []byte) {
-	s.sendHashedValidBlock(addr, bkdr(validBlock), validBlock)
+func writeHash(pktBuf *bytes.Buffer) {
+	binary.Write(pktBuf, binary.LittleEndian, bkdr(pktBuf.Bytes()))
+}
+
+func writeHashAndRet(pktBuf *bytes.Buffer) uint16 {
+	hash := bkdr(pktBuf.Bytes())
+	binary.Write(pktBuf, binary.LittleEndian, hash)
+	return hash
 }
 
 func (s *Session) Send(addr *net.UDPAddr, data []byte) {
-	validBlockBuf := bytes.NewBuffer([]byte{})
-	validBlockBuf.WriteByte(basicPacket)
-	validBlockBuf.Write(data)
+	pktBuf := makeBaseHeader(basicPacket, len(data))
 
-	s.sendValidBlock(addr, validBlockBuf.Bytes())
+	pktBuf.Write(data)
+
+	writeHash(pktBuf)
+	s.udpConn.WriteToUDP(pktBuf.Bytes(), addr)
 }
 
 func (s *Session) ReliableSend(addr *net.UDPAddr, data []byte) {
 	ts := time.Now()
 
-	validBlockBuf := bytes.NewBuffer([]byte{})
-	validBlockBuf.WriteByte(reliablePacket)
+	pktBuf := makeBaseHeader(reliablePacket, reliablePacketHeaderSz+len(data))
 
 	c := newConn()
 	v, loaded := s.connMap.LoadOrStore(addr.String(), c)
@@ -108,19 +99,18 @@ func (s *Session) ReliableSend(addr *net.UDPAddr, data []byte) {
 
 	id := atomic.AddUint32(&c.rpIDCount, 1)
 
-	binary.Write(validBlockBuf, binary.LittleEndian, reliablePacketHeader{
+	binary.Write(pktBuf, binary.LittleEndian, reliablePacketHeader{
 		id,
 	})
+	pktBuf.Write(data)
 
-	validBlockBuf.Write(data)
+	hash := writeHashAndRet(pktBuf)
 
-	validBlock := validBlockBuf.Bytes()
-	validBlockHash := bkdr(validBlock)
-
-	rpi := &rpInfo{validBlockHash, ts, 0}
+	rpi := &rpInfo{hash, ts, 0}
 	c.rpMap.Store(id, rpi)
 
-	s.sendHashedValidBlock(addr, validBlockHash, validBlock)
+	pkt := pktBuf.Bytes()
+	s.udpConn.WriteToUDP(pkt, addr)
 
 	go func() {
 		dur := time.Duration(atomic.LoadInt64(&c.rtt))
@@ -130,92 +120,74 @@ func (s *Session) ReliableSend(addr *net.UDPAddr, data []byte) {
 			time.Sleep(dur)
 			sleeped += dur
 
-			isResponsed := atomic.LoadUint32(&rpi.isResponsed)
-			if isResponsed == 1 {
+			if atomic.LoadUint32(&rpi.isResponsed) == 1 {
 				return
 			}
-			s.sendHashedValidBlock(addr, validBlockHash, validBlock)
+			s.udpConn.WriteToUDP(pkt, addr)
 		}
 		c.rpMap.Delete(id)
 	}()
 }
 
-func (s *Session) sendRpResp(addr *net.UDPAddr, receivedRpID uint32) {
-	validBlockBuf := bytes.NewBuffer([]byte{})
-	validBlockBuf.WriteByte(reliablePacketResponse)
+func (s *Session) sendRpResp(addr *net.UDPAddr, receivedRpID uint32, receivedRpHash uint16) {
+	pktBuf := makeBaseHeader(reliablePacketResponse, reliablePacketResponseHeaderSz)
 
-	validBlock := validBlockBuf.Bytes()
-	validBlockHash := bkdr(validBlock)
-
-	binary.Write(validBlockBuf, binary.LittleEndian, reliablePacketResponseHeader{
+	binary.Write(pktBuf, binary.LittleEndian, reliablePacketResponseHeader{
 		receivedRpID,
-		validBlockHash,
+		receivedRpHash,
 	})
 
-	s.sendHashedValidBlock(addr, validBlockHash, validBlock)
+	writeHash(pktBuf)
+	s.udpConn.WriteToUDP(pktBuf.Bytes(), addr)
 }
 
 func (s *Session) Listen() {
-	cache := make([]byte, 1024)
+	buf := make([]byte, 512)
 	for {
-		udpPktSz, addr, err := s.udpConn.ReadFromUDP(cache)
-		if err != nil || udpPktSz < baseHeaderSz {
+		udpPktSz, addr, err := s.udpConn.ReadFromUDP(buf)
+		if err != nil || udpPktSz < pktSzMin {
 			continue
 		}
 
-		var tlBaseHeader typeLessBaseHeader
-
-		ok := false
-
-		for i := 0; i < udpPktSz-baseHeaderSz; i++ {
-			buf := bytes.NewReader(cache[i:])
-			binary.Read(buf, binary.LittleEndian, &tlBaseHeader)
-
-			if tlBaseHeader.MgcNum == mgcNum {
-				ok = true
-				break
-			}
-		}
-
-		if !ok {
+		var bHeader baseHeader
+		binary.Read(bytes.NewReader(buf), binary.LittleEndian, &bHeader)
+		if bHeader.MgcNum != mgcNumValue || int(bHeader.Size) > udpPktSz {
 			continue
 		}
 
-		udpPkt := make([]byte, udpPktSz)
-		copy(udpPkt, cache)
+		pktSz := int(bHeader.Size)
+		pkt := make([]byte, pktSz)
+		copy(pkt, buf)
 
 		go func() {
 			var c *conn
 
-			pktSz := validBlockSz(udpPkt[typeByteIndex:], tlBaseHeader.Hash)
-			if pktSz == 0 {
+			var hash uint16
+			dataEnd := pktSz - hashSz
+			binary.Read(bytes.NewReader(pkt[dataEnd:]), binary.LittleEndian, &hash)
+			if hash != bkdr(pkt[:dataEnd]) {
 				return
 			}
-			pktSz += typeLessBaseHeaderSz
 
-			switch udpPkt[typeByteIndex] {
+			switch pkt[typeIndex] {
 
 			case basicPacket:
-				if pktSz == baseHeaderSz {
+				if pktSz == pktSzMin {
 					return
 				}
-				validBlock := udpPkt[baseHeaderSz:pktSz]
-				s.receiver(addr, validBlock)
+				s.receiver(addr, pkt[baseHeaderSz:dataEnd])
 
 			case reliablePacket:
-				var secHeader reliablePacketHeader
-				secHeaderSz := binary.Size(secHeader)
-				HeaderSz := baseHeaderSz + secHeaderSz
+				var rpHeader reliablePacketHeader
+				headersSz := baseHeaderSz + reliablePacketHeaderSz
 
-				if pktSz < HeaderSz {
+				if pktSz < headersSz {
 					return
 				}
 
-				validBlock := udpPkt[baseHeaderSz:pktSz]
-				buf := bytes.NewReader(validBlock)
-				binary.Read(buf, binary.LittleEndian, &secHeader)
+				binary.Read(bytes.NewReader(pkt[baseHeaderSz:]), binary.LittleEndian, &rpHeader)
 
-				s.sendRpResp(addr, secHeader.ReliablePacketID)
+				s.sendRpResp(addr, rpHeader.ReliablePacketID, hash)
 
 				c = newConn()
 				v, loaded := s.connMap.LoadOrStore(addr.String(), c)
@@ -223,28 +195,25 @@ func (s *Session) Listen() {
 					c = v.(*conn)
 				}
 
-				v, loaded = c.rvRpMap.LoadOrStore(secHeader.ReliablePacketID, true)
+				v, loaded = c.rvRpMap.LoadOrStore(rpHeader.ReliablePacketID, true)
 				if loaded {
 					return
 				}
 
-				if pktSz == HeaderSz {
+				if pktSz == headersSz+hashSz {
 					return
 				}
-				s.receiver(addr, validBlock[secHeaderSz:])
+				s.receiver(addr, pkt[baseHeaderSz:dataEnd])
 
 			case reliablePacketResponse:
-				var secHeader reliablePacketResponseHeader
-				secHeaderSz := binary.Size(secHeader)
-				HeaderSz := baseHeaderSz + secHeaderSz
+				var rprHeader reliablePacketResponseHeader
+				headersSz := baseHeaderSz + reliablePacketResponseHeaderSz
 
-				if pktSz < HeaderSz {
+				if pktSz < headersSz {
 					return
 				}
 
-				validBlock := udpPkt[baseHeaderSz:pktSz]
-				buf := bytes.NewReader(validBlock)
-				binary.Read(buf, binary.LittleEndian, &secHeader)
+				binary.Read(bytes.NewReader(pkt[baseHeaderSz:]), binary.LittleEndian, &rprHeader)
 
 				v, loaded := s.connMap.Load(addr.String())
 				if !loaded {
@@ -252,17 +221,17 @@ func (s *Session) Listen() {
 				}
 				c = v.(*conn)
 
-				v, loaded = c.rpMap.Load(secHeader.ReceivedReliablePacketID)
+				v, loaded = c.rpMap.Load(rprHeader.ReceivedReliablePacketID)
 				if !loaded {
 					return
 				}
 				rpi := v.(*rpInfo)
 
-				if rpi.hash != secHeader.ReceivedReliablePacketHash {
+				if rpi.hash != rprHeader.ReceivedReliablePacketHash {
 					return
 				}
 
-				c.rpMap.Delete(secHeader.ReceivedReliablePacketID)
+				c.rpMap.Delete(rprHeader.ReceivedReliablePacketID)
 
 				atomic.StoreUint32(&rpi.isResponsed, 1)
 
