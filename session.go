@@ -48,7 +48,7 @@ func NewSession(addr string, receiver func(addr *net.UDPAddr, data []byte)) (*Se
 	return NewSessionFromUDP(udpAddr, receiver)
 }
 
-func bkdr(data []byte) uint16 {
+func bkdrHash(data []byte) uint16 {
 	var seed uint64 = 131
 	var hash uint64 = 1
 	for i := 0; i < len(data); i++ {
@@ -68,11 +68,11 @@ func makeBaseHeader(typ uint8, secHeaderAndBodySz int) *bytes.Buffer {
 }
 
 func writeHash(pktBuf *bytes.Buffer) {
-	binary.Write(pktBuf, binary.LittleEndian, bkdr(pktBuf.Bytes()))
+	binary.Write(pktBuf, binary.LittleEndian, bkdrHash(pktBuf.Bytes()[typeIndex:]))
 }
 
 func writeHashAndRet(pktBuf *bytes.Buffer) uint16 {
-	hash := bkdr(pktBuf.Bytes())
+	hash := bkdrHash(pktBuf.Bytes()[typeIndex:])
 	binary.Write(pktBuf, binary.LittleEndian, hash)
 	return hash
 }
@@ -165,7 +165,7 @@ func (s *Session) Listen() {
 			var hash uint16
 			dataEnd := pktSz - hashSz
 			binary.Read(bytes.NewReader(pkt[dataEnd:]), binary.LittleEndian, &hash)
-			if hash != bkdr(pkt[:dataEnd]) {
+			if hash != bkdrHash(pkt[typeIndex:dataEnd]) {
 				return
 			}
 
