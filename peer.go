@@ -33,7 +33,7 @@ func newConnContext() *connContext {
 
 type Receiver func(conn *Conn, data []byte)
 
-type Session struct {
+type Peer struct {
 	udpConn    *net.UDPConn
 	connCtxMap sync.Map // map[string]*connContext
 
@@ -42,50 +42,50 @@ type Session struct {
 	closed chan bool
 }
 
-func newSession(udpAddr *net.UDPAddr, receiver Receiver) (*Session, error) {
+func newPeer(udpAddr *net.UDPAddr, receiver Receiver) (*Peer, error) {
 	udpConn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{udpConn, sync.Map{}, receiver, make(chan bool, 1)}
-	go s.listen()
-	return s, nil
+	peer := &Peer{udpConn, sync.Map{}, receiver, make(chan bool, 1)}
+	go peer.listen()
+	return peer, nil
 }
 
-func NewSession(addr string, receiver Receiver) (*Session, error) {
+func NewPeer(addr string, receiver Receiver) (*Peer, error) {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err
 	}
-	return newSession(udpAddr, receiver)
+	return newPeer(udpAddr, receiver)
 }
 
 func Listen(addr string, receiver Receiver) error {
-	s, err := NewSession(addr, receiver)
+	peer, err := NewPeer(addr, receiver)
 	if err != nil {
 		return err
 	}
-	s.WaitClose()
+	peer.WaitClose()
 	return nil
 }
 
 type Conn struct {
-	s       *Session
+	peer    *Peer
 	addr    *net.UDPAddr
 	addrStr string
 	ctx     *connContext
 }
 
-func (s *Session) dial(addr *net.UDPAddr) *Conn {
-	return &Conn{s, addr, "", nil}
+func (peer *Peer) dial(addr *net.UDPAddr) *Conn {
+	return &Conn{peer, addr, "", nil}
 }
 
-func (s *Session) Dial(addr string) (*Conn, error) {
+func (peer *Peer) Dial(addr string) (*Conn, error) {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err
 	}
-	return s.dial(udpAddr), nil
+	return peer.dial(udpAddr), nil
 }
 
 func (c *Conn) Addr() string {
@@ -97,14 +97,14 @@ func (c *Conn) Addr() string {
 
 func (c *Conn) getOrNewCtx() {
 	c.ctx = newConnContext()
-	v, loaded := c.s.connCtxMap.LoadOrStore(c.addr.String(), c.ctx)
+	v, loaded := c.peer.connCtxMap.LoadOrStore(c.addr.String(), c.ctx)
 	if loaded {
 		c.ctx = v.(*connContext)
 	}
 }
 
 func (c *Conn) getCtx() bool {
-	v, loaded := c.s.connCtxMap.Load(c.addr.String())
+	v, loaded := c.peer.connCtxMap.Load(c.addr.String())
 	if loaded {
 		c.ctx = v.(*connContext)
 		return true
@@ -147,7 +147,7 @@ func (c *Conn) Send(data []byte) {
 	pktBuf.Write(data)
 
 	writeHash(pktBuf)
-	c.s.udpConn.WriteToUDP(pktBuf.Bytes(), c.addr)
+	c.peer.udpConn.WriteToUDP(pktBuf.Bytes(), c.addr)
 }
 
 func (c *Conn) ReliableSend(data []byte) {
@@ -172,7 +172,7 @@ func (c *Conn) ReliableSend(data []byte) {
 
 	c.ctx.rtnsGrtMtx.Lock()
 
-	c.s.udpConn.WriteToUDP(pkt, c.addr)
+	c.peer.udpConn.WriteToUDP(pkt, c.addr)
 
 	rpCache := &reliablePacketCache{ts, hash, pkt, false}
 
@@ -215,7 +215,7 @@ func (c *Conn) ReliableSend(data []byte) {
 				}
 				c.ctx.rtnsGrtMtx.Unlock()
 
-				c.s.udpConn.WriteToUDP(rpCache.pkt, c.addr)
+				c.peer.udpConn.WriteToUDP(rpCache.pkt, c.addr)
 			}
 		}
 	}()
@@ -223,7 +223,7 @@ func (c *Conn) ReliableSend(data []byte) {
 	c.ctx.rtnsGrtMtx.Unlock()
 }
 
-func (s *Session) respondRP(addr *net.UDPAddr, receivedRpID uint32, receivedRpHash uint16) {
+func (peer *Peer) respondRP(addr *net.UDPAddr, receivedRpID uint32, receivedRpHash uint16) {
 	pktBuf := makeBaseHeader(reliablePacketResponse, reliablePacketResponseHeaderSz)
 
 	binary.Write(pktBuf, binary.LittleEndian, reliablePacketResponseHeader{
@@ -232,13 +232,13 @@ func (s *Session) respondRP(addr *net.UDPAddr, receivedRpID uint32, receivedRpHa
 	})
 
 	writeHash(pktBuf)
-	s.udpConn.WriteToUDP(pktBuf.Bytes(), addr)
+	peer.udpConn.WriteToUDP(pktBuf.Bytes(), addr)
 }
 
-func (s *Session) listen() {
+func (peer *Peer) listen() {
 	buf := make([]byte, 512)
 	for {
-		udpPktSz, addr, err := s.udpConn.ReadFromUDP(buf)
+		udpPktSz, addr, err := peer.udpConn.ReadFromUDP(buf)
 		if err != nil || udpPktSz < pktSzMin {
 			continue
 		}
@@ -267,7 +267,11 @@ func (s *Session) listen() {
 				if pktSz == pktSzMin {
 					return
 				}
-				s.receiver(s.dial(addr), pkt[baseHeaderSz:dataEnd])
+
+				if peer.receiver == nil {
+					return
+				}
+				peer.receiver(peer.dial(addr), pkt[baseHeaderSz:dataEnd])
 
 			case reliablePacket:
 				var rpHeader reliablePacketHeader
@@ -279,9 +283,9 @@ func (s *Session) listen() {
 
 				binary.Read(bytes.NewReader(pkt[baseHeaderSz:]), binary.LittleEndian, &rpHeader)
 
-				s.respondRP(addr, rpHeader.ReliablePacketID, hash)
+				peer.respondRP(addr, rpHeader.ReliablePacketID, hash)
 
-				c := s.dial(addr)
+				c := peer.dial(addr)
 				c.getOrNewCtx()
 
 				_, loaded := c.ctx.rvRpMap.LoadOrStore(rpHeader.ReliablePacketID, true)
@@ -292,7 +296,11 @@ func (s *Session) listen() {
 				if pktSz == headersSz+hashSz {
 					return
 				}
-				s.receiver(c, pkt[baseHeaderSz:dataEnd])
+
+				if peer.receiver == nil {
+					return
+				}
+				peer.receiver(c, pkt[baseHeaderSz:dataEnd])
 
 			case reliablePacketResponse:
 				var rprHeader reliablePacketResponseHeader
@@ -304,7 +312,7 @@ func (s *Session) listen() {
 
 				binary.Read(bytes.NewReader(pkt[baseHeaderSz:]), binary.LittleEndian, &rprHeader)
 
-				c := s.dial(addr)
+				c := peer.dial(addr)
 				if !c.getCtx() {
 					return
 				}
@@ -331,10 +339,10 @@ func (s *Session) listen() {
 			}
 		}()
 	}
-	s.closed <- true
+	peer.closed <- true
 }
 
-func (s *Session) WaitClose() {
-	<-s.closed
-	s.closed <- true
+func (peer *Peer) WaitClose() {
+	<-peer.closed
+	peer.closed <- true
 }
