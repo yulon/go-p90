@@ -3,346 +3,247 @@ package p90
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 )
 
-type reliablePacketCache struct {
-	ts          time.Time
-	hash        uint16
-	pkt         []byte
-	isResponsed bool
-}
-
-type connContext struct {
-	rpIDCount uint32
-
-	rpMap       map[uint32]*reliablePacketCache
-	hasRtnsLoop bool
-	rtnsGrtMtx  sync.Mutex
-
-	rvRpMap sync.Map // map[rpID]interface{}
-	rtt     int64
-}
-
-func newConnContext() *connContext {
-	return &connContext{rpMap: map[uint32]*reliablePacketCache{}, hasRtnsLoop: false, rtt: int64(time.Second)}
-}
-
-type Receiver func(conn *Conn, data []byte)
-
 type Peer struct {
-	udpConn    *net.UDPConn
-	connCtxMap sync.Map // map[string]*connContext
-
-	receiver Receiver
-
-	closed chan bool
+	mtx       sync.Mutex
+	locLnr    net.PacketConn
+	conMap    sync.Map
+	acptCh    chan *Conn
+	wasClosed bool
 }
 
-func newPeer(udpAddr *net.UDPAddr, receiver Receiver) (*Peer, error) {
-	udpConn, err := net.ListenUDP("udp", udpAddr)
+func (pr *Peer) newErr(errStr string) error {
+	return errors.New("p90 peer (" + pr.Addr().String() + ") " + errStr)
+}
+
+func (pr *Peer) newWasClosedErr() error {
+	return pr.newErr("was closed.")
+}
+
+func (pr *Peer) writeTo(b []byte, addr net.Addr) (int, error) {
+	pr.mtx.Lock()
+	defer pr.mtx.Unlock()
+
+	if pr.wasClosed {
+		return 0, pr.newWasClosedErr()
+	}
+	return pr.locLnr.WriteTo(b, addr)
+}
+
+func (pr *Peer) bypassRecvPacket(from net.Addr, to net.PacketConn, h *header, p []byte) {
+	r := bytes.NewBuffer(p)
+	err := binary.Read(r, binary.LittleEndian, h)
+
+	if err != nil || h.MagNum != MagicNumber || int(h.Type) >= len(isReliableType) {
+		return
+	}
+
+	var con *Conn
+	v, ok := pr.conMap.Load(h.ConID)
+	if ok {
+		con = v.(*Conn)
+		con.updateRecvInfo(from)
+	} else {
+		if pr.acptCh == nil {
+			return
+		}
+
+		con = newConn(h.ConID, pr, from)
+		con.updateRecvInfo(from)
+
+		actual, loaded := pr.conMap.LoadOrStore(h.ConID, con)
+		if loaded {
+			con = actual.(*Conn)
+			con.updateRecvInfo(from)
+		} else {
+			err = pr.putAcpt(con)
+			if err != nil {
+				con.closeUS(err)
+				return
+			}
+		}
+	}
+	con.handleRecvPacket(from, to, h, r)
+	return
+}
+
+func listen(pktCon net.PacketConn, isUnique bool) (*Peer, error) {
+	pr := &Peer{
+		locLnr: pktCon,
+	}
+	if !isUnique {
+		pr.acptCh = make(chan *Conn, 1)
+	}
+	go func() {
+		var h header
+		b := make([]byte, 1280)
+		for {
+			sz, addr, err := pktCon.ReadFrom(b)
+			if err != nil {
+				return
+			}
+			pr.bypassRecvPacket(addr, pktCon, &h, b[:sz])
+		}
+	}()
+	go func() {
+		for {
+			dur := 90 * time.Second
+
+			now := time.Now()
+			pr.conMap.Range(func(_, v interface{}) bool {
+				con := v.(*Conn)
+				con.mtx.Lock()
+				defer con.mtx.Unlock()
+
+				diff := now.Sub(con.lastRecvTime)
+				if diff > con.recvTimeout {
+					con.closeUS(con.newTimeoutErr(false))
+					return true
+				}
+				if diff < dur {
+					dur = diff
+				}
+				return true
+			})
+
+			time.Sleep(dur)
+		}
+	}()
+	return pr, nil
+}
+
+func ListenPacketConn(pktCon net.PacketConn) (*Peer, error) {
+	return listen(pktCon, false)
+}
+
+func ListenUDP(udpAddr *net.UDPAddr) (*Peer, error) {
+	udpLnr, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
 		return nil, err
 	}
-	peer := &Peer{udpConn, sync.Map{}, receiver, make(chan bool, 1)}
-	go peer.listen()
-	return peer, nil
+	return ListenPacketConn(udpLnr)
 }
 
-func NewPeer(addr string, receiver Receiver) (*Peer, error) {
+func Listen(addrStr string) (*Peer, error) {
+	udpAddr, err := net.ResolveUDPAddr("udp", addrStr)
+	if err != nil {
+		return nil, err
+	}
+	return ListenUDP(udpAddr)
+}
+
+func (pr *Peer) dialAddrUS(addr net.Addr) (*Conn, error) {
+	id, err := uuid.NewUUID()
+	if err != nil {
+		return nil, err
+	}
+	return newConn(id, pr, addr), nil
+}
+
+func (pr *Peer) DialAddr(addr net.Addr) (*Conn, error) {
+	pr.mtx.Lock()
+	defer pr.mtx.Unlock()
+
+	if pr.wasClosed {
+		return nil, pr.newWasClosedErr()
+	}
+	return pr.dialAddrUS(addr)
+}
+
+func (pr *Peer) Dial(addrStr string) (*Conn, error) {
+	pr.mtx.Lock()
+	defer pr.mtx.Unlock()
+
+	if pr.wasClosed {
+		return nil, pr.newWasClosedErr()
+	}
+	addr, err := ResolveAddr(pr.locLnr.LocalAddr().Network(), addrStr)
+	if err != nil {
+		return nil, err
+	}
+	return pr.dialAddrUS(addr)
+}
+
+func DialAddr(locPktCon net.PacketConn, rmtAddr net.Addr) (*Conn, error) {
+	pr, err := listen(locPktCon, true)
+	if err != nil {
+		return nil, err
+	}
+	con, err := pr.DialAddr(rmtAddr)
+	if err != nil {
+		return nil, err
+	}
+	return con, err
+}
+
+func DialUDP(udpAddr *net.UDPAddr) (*Conn, error) {
+	udpLnr, err := net.ListenUDP("udp", NewLocalUDPAddr(0, udpAddr))
+	if err != nil {
+		return nil, err
+	}
+	return DialAddr(udpLnr, udpAddr)
+}
+
+func Dial(addr string) (*Conn, error) {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err
 	}
-	return newPeer(udpAddr, receiver)
+	return DialUDP(udpAddr)
 }
 
-func Listen(addr string, receiver Receiver) error {
-	peer, err := NewPeer(addr, receiver)
-	if err != nil {
-		return err
+func (pr *Peer) putAcpt(con *Conn) error {
+	pr.mtx.Lock()
+	defer pr.mtx.Unlock()
+
+	if pr.wasClosed {
+		return pr.newWasClosedErr()
 	}
-	peer.WaitClose()
+	pr.acptCh <- con
 	return nil
 }
 
-type Conn struct {
-	peer    *Peer
-	addr    *net.UDPAddr
-	addrStr string
-	ctx     *connContext
-}
-
-func (peer *Peer) dial(addr *net.UDPAddr) *Conn {
-	return &Conn{peer, addr, "", nil}
-}
-
-func (peer *Peer) Dial(addr string) (*Conn, error) {
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return nil, err
+func (pr *Peer) AcceptGatling() (*Conn, error) {
+	con, ok := <-pr.acptCh
+	if !ok || con.IsClose() {
+		return nil, pr.newWasClosedErr()
 	}
-	return peer.dial(udpAddr), nil
+	return con, nil
 }
 
-func (c *Conn) Addr() string {
-	if len(c.addrStr) == 0 {
-		c.addrStr = c.addr.String()
+func (pr *Peer) Accept() (net.Conn, error) {
+	return pr.AcceptGatling()
+}
+
+func (pr *Peer) Addr() net.Addr {
+	return pr.locLnr.LocalAddr()
+}
+
+func (pr *Peer) Close() error {
+	pr.mtx.Lock()
+	defer pr.mtx.Unlock()
+
+	if pr.wasClosed {
+		return pr.newWasClosedErr()
 	}
-	return c.addrStr
-}
+	pr.wasClosed = true
 
-func (c *Conn) getOrNewCtx() {
-	c.ctx = newConnContext()
-	v, loaded := c.peer.connCtxMap.LoadOrStore(c.addr.String(), c.ctx)
-	if loaded {
-		c.ctx = v.(*connContext)
+	if pr.acptCh != nil {
+		close(pr.acptCh)
 	}
+	pr.locLnr.Close()
+	return nil
 }
 
-func (c *Conn) getCtx() bool {
-	v, loaded := c.peer.connCtxMap.Load(c.addr.String())
-	if loaded {
-		c.ctx = v.(*connContext)
-		return true
-	}
-	return false
-}
-
-func bkdrHash(data []byte) uint16 {
-	var seed uint64 = 131
-	var hash uint64 = 1
-	for i := 0; i < len(data); i++ {
-		hash = hash*seed + uint64(data[i])
-	}
-	return uint16(hash % 65535)
-}
-
-func makeBaseHeader(typ uint8, secHeaderAndBodySz int) *bytes.Buffer {
-	pktBuf := bytes.NewBuffer([]byte{})
-	binary.Write(pktBuf, binary.LittleEndian, baseHeader{
-		mgcNumValue,
-		typ,
-		uint16(baseHeaderSz + secHeaderAndBodySz + hashSz),
+func (pr *Peer) Range(f func(con *Conn) bool) {
+	pr.conMap.Range(func(_, v interface{}) bool {
+		return f(v.(*Conn))
 	})
-	return pktBuf
-}
-
-func writeHash(pktBuf *bytes.Buffer) {
-	binary.Write(pktBuf, binary.LittleEndian, bkdrHash(pktBuf.Bytes()[typeIndex:]))
-}
-
-func writeHashAndRet(pktBuf *bytes.Buffer) uint16 {
-	hash := bkdrHash(pktBuf.Bytes()[typeIndex:])
-	binary.Write(pktBuf, binary.LittleEndian, hash)
-	return hash
-}
-
-func (c *Conn) Send(data []byte) {
-	pktBuf := makeBaseHeader(basicPacket, len(data))
-
-	pktBuf.Write(data)
-
-	writeHash(pktBuf)
-	c.peer.udpConn.WriteToUDP(pktBuf.Bytes(), c.addr)
-}
-
-func (c *Conn) ReliableSend(data []byte) {
-	ts := time.Now()
-
-	pktBuf := makeBaseHeader(reliablePacket, reliablePacketHeaderSz+len(data))
-
-	if c.ctx == nil {
-		c.getOrNewCtx()
-	}
-
-	id := atomic.AddUint32(&c.ctx.rpIDCount, 1)
-
-	binary.Write(pktBuf, binary.LittleEndian, reliablePacketHeader{
-		id,
-	})
-	pktBuf.Write(data)
-
-	hash :=
-		writeHashAndRet(pktBuf)
-	pkt := pktBuf.Bytes()
-
-	c.ctx.rtnsGrtMtx.Lock()
-
-	c.peer.udpConn.WriteToUDP(pkt, c.addr)
-
-	rpCache := &reliablePacketCache{ts, hash, pkt, false}
-
-	c.ctx.rpMap[id] = rpCache
-
-	if c.ctx.hasRtnsLoop {
-		c.ctx.rtnsGrtMtx.Unlock()
-		return
-	}
-	c.ctx.hasRtnsLoop = true
-
-	go func() {
-		for {
-			var rpCache *reliablePacketCache
-
-			c.ctx.rtnsGrtMtx.Lock()
-
-			for _, rpCache = range c.ctx.rpMap {
-				break
-			}
-			if rpCache == nil {
-				c.ctx.hasRtnsLoop = false
-				c.ctx.rtnsGrtMtx.Unlock()
-				return
-			}
-
-			c.ctx.rtnsGrtMtx.Unlock()
-
-			dur := time.Duration(atomic.LoadInt64(&c.ctx.rtt))
-			var sleeped time.Duration
-			for sleeped < time.Minute {
-				dur *= 2
-				time.Sleep(dur)
-				sleeped += dur
-
-				c.ctx.rtnsGrtMtx.Lock()
-				if rpCache.isResponsed {
-					c.ctx.rtnsGrtMtx.Unlock()
-					break
-				}
-				c.ctx.rtnsGrtMtx.Unlock()
-
-				c.peer.udpConn.WriteToUDP(rpCache.pkt, c.addr)
-			}
-		}
-	}()
-
-	c.ctx.rtnsGrtMtx.Unlock()
-}
-
-func (peer *Peer) respondRP(addr *net.UDPAddr, receivedRpID uint32, receivedRpHash uint16) {
-	pktBuf := makeBaseHeader(reliablePacketResponse, reliablePacketResponseHeaderSz)
-
-	binary.Write(pktBuf, binary.LittleEndian, reliablePacketResponseHeader{
-		receivedRpID,
-		receivedRpHash,
-	})
-
-	writeHash(pktBuf)
-	peer.udpConn.WriteToUDP(pktBuf.Bytes(), addr)
-}
-
-func (peer *Peer) listen() {
-	buf := make([]byte, 512)
-	for {
-		udpPktSz, addr, err := peer.udpConn.ReadFromUDP(buf)
-		if err != nil || udpPktSz < pktSzMin {
-			continue
-		}
-
-		var bHeader baseHeader
-		binary.Read(bytes.NewReader(buf), binary.LittleEndian, &bHeader)
-		if bHeader.MgcNum != mgcNumValue || int(bHeader.Size) > udpPktSz {
-			continue
-		}
-
-		pktSz := int(bHeader.Size)
-		pkt := make([]byte, pktSz)
-		copy(pkt, buf)
-
-		go func() {
-			var hash uint16
-			dataEnd := pktSz - hashSz
-			binary.Read(bytes.NewReader(pkt[dataEnd:]), binary.LittleEndian, &hash)
-			if hash != bkdrHash(pkt[typeIndex:dataEnd]) {
-				return
-			}
-
-			switch pkt[typeIndex] {
-
-			case basicPacket:
-				if pktSz == pktSzMin {
-					return
-				}
-
-				if peer.receiver == nil {
-					return
-				}
-				peer.receiver(peer.dial(addr), pkt[baseHeaderSz:dataEnd])
-
-			case reliablePacket:
-				var rpHeader reliablePacketHeader
-				headersSz := baseHeaderSz + reliablePacketHeaderSz
-
-				if pktSz < headersSz {
-					return
-				}
-
-				binary.Read(bytes.NewReader(pkt[baseHeaderSz:]), binary.LittleEndian, &rpHeader)
-
-				peer.respondRP(addr, rpHeader.ReliablePacketID, hash)
-
-				c := peer.dial(addr)
-				c.getOrNewCtx()
-
-				_, loaded := c.ctx.rvRpMap.LoadOrStore(rpHeader.ReliablePacketID, true)
-				if loaded {
-					return
-				}
-
-				if pktSz == headersSz+hashSz {
-					return
-				}
-
-				if peer.receiver == nil {
-					return
-				}
-				peer.receiver(c, pkt[baseHeaderSz:dataEnd])
-
-			case reliablePacketResponse:
-				var rprHeader reliablePacketResponseHeader
-				headersSz := baseHeaderSz + reliablePacketResponseHeaderSz
-
-				if pktSz < headersSz {
-					return
-				}
-
-				binary.Read(bytes.NewReader(pkt[baseHeaderSz:]), binary.LittleEndian, &rprHeader)
-
-				c := peer.dial(addr)
-				if !c.getCtx() {
-					return
-				}
-
-				c.ctx.rtnsGrtMtx.Lock()
-
-				rpCache, loaded := c.ctx.rpMap[rprHeader.ReceivedReliablePacketID]
-				if !loaded {
-					c.ctx.rtnsGrtMtx.Unlock()
-					return
-				}
-
-				if rpCache.hash != rprHeader.ReceivedReliablePacketHash {
-					c.ctx.rtnsGrtMtx.Unlock()
-					return
-				}
-
-				rpCache.isResponsed = true
-				delete(c.ctx.rpMap, rprHeader.ReceivedReliablePacketID)
-
-				atomic.StoreInt64(&c.ctx.rtt, int64(time.Now().Sub(rpCache.ts)))
-
-				c.ctx.rtnsGrtMtx.Unlock()
-			}
-		}()
-	}
-	peer.closed <- true
-}
-
-func (peer *Peer) WaitClose() {
-	<-peer.closed
-	peer.closed <- true
 }
