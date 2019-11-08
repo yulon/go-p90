@@ -61,20 +61,12 @@ type Conn struct {
 
 	recvPktSorter *sorter
 
-	recvPktCache [][]byte
-	recvPktErr   error
-	recvPktMtx   sync.Mutex
-	recvPktCond  *sync.Cond
+	recvPktBuf packetBuffer
 
 	wStrmPktCount uint64
 	wStrmMtx      sync.Mutex
 
-	rStrmSorter *sorter
-	rStrmPkts   [][]byte
-	rStrmBuf    *bytes.Buffer
-	rStrmErr    error
-	rStrmMtx    sync.Mutex
-	rStrmCond   *sync.Cond
+	rStrmBuf streamPacketBuffer
 
 	closeState byte
 }
@@ -146,8 +138,8 @@ func (con *Conn) closeUS(recvErr error) error {
 		con.onSentPktCond.Broadcast()
 	}
 
-	con.putRecvPkt(nil, recvErr)
-	con.putReadStrmPkt(0, nil, recvErr)
+	con.recvPktBuf.Close(recvErr)
+	con.rStrmBuf.Close(recvErr)
 
 	con.closeState = 2
 	return nil
@@ -190,6 +182,8 @@ func (con *Conn) updateRecvInfo(from net.Addr) {
 	con.lastSendTime = con.lastRecvTime
 }
 
+var errClosedByRemote = errors.New("closed by remote")
+
 func (con *Conn) handleRecvPacket(from net.Addr, to net.PacketConn, h *header, r *bytes.Buffer) {
 	if isReliableType[h.Type] && h.PktID > 0 {
 		con.send(pktReceiveds, h.PktID)
@@ -203,7 +197,7 @@ func (con *Conn) handleRecvPacket(from net.Addr, to net.PacketConn, h *header, r
 	case pktData:
 		fallthrough
 	case pktUnreliableData:
-		con.putRecvPkt(r.Bytes(), nil)
+		con.recvPktBuf.Put(r.Bytes())
 
 	case pktReceiveds:
 		pktIDs := make([]uint64, r.Len()/8)
@@ -213,7 +207,7 @@ func (con *Conn) handleRecvPacket(from net.Addr, to net.PacketConn, h *header, r
 	case pktRequests:
 
 	case pktClosed:
-		con.close(errors.New("closed by remote"))
+		con.close(errClosedByRemote)
 
 	case pktHowAreYou:
 		atomic.StoreUint32(&con.isWaitingFine, 0)
@@ -221,7 +215,7 @@ func (con *Conn) handleRecvPacket(from net.Addr, to net.PacketConn, h *header, r
 	case pktStreamData:
 		var strmPktIx uint64
 		binary.Read(r, binary.LittleEndian, &strmPktIx)
-		con.putReadStrmPkt(strmPktIx, r.Bytes(), nil)
+		con.rStrmBuf.Put(strmPktIx, r.Bytes())
 	}
 }
 
@@ -613,40 +607,12 @@ func (con *Conn) unresend(pktIDs ...uint64) {
 	con.mtx.Unlock()
 }
 
-func (con *Conn) putRecvPkt(data []byte, err error) {
-	con.recvPktMtx.Lock()
-	if err == nil {
-		dataCpy := make([]byte, len(data))
-		copy(dataCpy, data)
-		con.recvPktCache = append(con.recvPktCache, dataCpy)
-	} else {
-		con.recvPktErr = err
+func (con *Conn) Recv() (pkt []byte, err error) {
+	pkt, err = con.recvPktBuf.Get()
+	if err != nil {
+		err = con.opErr("Recv", err)
 	}
-	if con.recvPktCond != nil {
-		con.recvPktMtx.Unlock()
-		con.recvPktCond.Broadcast()
-		return
-	}
-	con.recvPktMtx.Unlock()
-}
-
-func (con *Conn) Recv() ([]byte, error) {
-	con.recvPktMtx.Lock()
-	defer con.recvPktMtx.Unlock()
-
-	for {
-		if len(con.recvPktCache) > 0 {
-			data := con.recvPktCache[0]
-			con.recvPktCache = con.recvPktCache[1:]
-			return data, nil
-		} else if con.recvPktErr != nil {
-			return nil, con.opErr("Recv", con.recvPktErr)
-		}
-		if con.recvPktCond == nil {
-			con.recvPktCond = sync.NewCond(&con.recvPktMtx)
-		}
-		con.recvPktCond.Wait()
-	}
+	return
 }
 
 func (con *Conn) Write(b []byte) (int, error) {
@@ -675,49 +641,10 @@ func (con *Conn) Write(b []byte) (int, error) {
 	}
 }
 
-func (con *Conn) putReadStrmPkt(ix uint64, p []byte, err error) {
-	con.rStrmMtx.Lock()
-	if err == nil {
-		if con.rStrmBuf == nil {
-			con.rStrmBuf = bytes.NewBuffer([]byte{})
-			con.rStrmSorter = newSorter(nil, func(datas []indexedData) {
-				for _, data := range datas {
-					con.rStrmBuf.Write(data.val.([]byte))
-				}
-			})
-		}
-		if con.rStrmSorter.TryAdd(ix, p) == false {
-			con.rStrmMtx.Unlock()
-			panic("putReadStrmPkt: duplicate index")
-		}
-	} else {
-		con.rStrmErr = err
+func (con *Conn) Read(b []byte) (n int, err error) {
+	n, err = con.rStrmBuf.Read(b)
+	if err != nil {
+		err = con.opErr("Read", err)
 	}
-	if con.rStrmCond != nil {
-		con.rStrmMtx.Unlock()
-		con.rStrmCond.Broadcast()
-		return
-	}
-	con.rStrmMtx.Unlock()
-}
-
-func (con *Conn) Read(b []byte) (int, error) {
-	con.rStrmMtx.Lock()
-	defer con.rStrmMtx.Unlock()
-
-	for {
-		if con.rStrmBuf != nil && con.rStrmBuf.Len() > 0 {
-			sz, err := con.rStrmBuf.Read(b)
-			if err != nil {
-				panic(err)
-			}
-			return sz, nil
-		} else if con.rStrmErr != nil {
-			return 0, con.opErr("Read", con.rStrmErr)
-		}
-		if con.rStrmCond == nil {
-			con.rStrmCond = sync.NewCond(&con.rStrmMtx)
-		}
-		con.rStrmCond.Wait()
-	}
+	return
 }
