@@ -90,23 +90,22 @@ func newConn(id uuid.UUID, locPr *Peer, rmtAddr net.Addr) *Conn {
 }
 
 func (con *Conn) opErr(op string, srcErr error) error {
+	if srcErr == nil {
+		return nil
+	}
 	return &net.OpError{Op: op, Net: "p90", Source: con.LocalAddr(), Addr: con.rmtAddr, Err: srcErr}
 }
 
-func (con *Conn) newOpErr(op, srcErrStr string) error {
-	return con.opErr(op, errors.New(srcErrStr))
-}
+var errWasClosed = errors.New("was closed")
 
-func (con *Conn) newOpErrWasClosed(op string) error {
-	return con.newOpErr(op, "was closed")
-}
+var errClosedByLocal = errors.New("closed by local")
 
 func (con *Conn) closeUS(recvErr error) error {
 	if con.closeState > 1 {
 		return nil
 	}
 	if recvErr == nil {
-		recvErr = errors.New("closed by local")
+		recvErr = errClosedByLocal
 		if con.closeState > 0 {
 			for con.closeState == 1 {
 				con.flushUS()
@@ -186,7 +185,9 @@ var errClosedByRemote = errors.New("closed by remote")
 
 func (con *Conn) handleRecvPacket(from net.Addr, to net.PacketConn, h *header, r *bytes.Buffer) {
 	if isReliableType[h.Type] && h.PktID > 0 {
-		con.send(pktReceiveds, h.PktID)
+		if con.send(pktReceiveds, h.PktID) != nil {
+			return
+		}
 		if !con.recvPktSorter.TryAdd(h.PktID, nil) {
 			return
 		}
@@ -291,7 +292,7 @@ func (con *Conn) SetReadDeadline(t time.Time) error {
 	defer con.mtx.Unlock()
 
 	if con.closeState > 0 {
-		return con.newOpErrWasClosed("SetReadDeadline")
+		return con.opErr("SetReadDeadline", errWasClosed)
 	}
 	con.recvTimeout = t.Sub(time.Now())
 	return nil
@@ -302,7 +303,7 @@ func (con *Conn) SetWriteDeadline(t time.Time) error {
 	defer con.mtx.Unlock()
 
 	if con.closeState > 0 {
-		return con.newOpErrWasClosed("SetWriteDeadline")
+		return con.opErr("SetWriteDeadline", errWasClosed)
 	}
 	con.sendTimeout = t.Sub(time.Now())
 	return nil
@@ -313,7 +314,7 @@ func (con *Conn) SetDeadline(t time.Time) error {
 	defer con.mtx.Unlock()
 
 	if con.closeState > 0 {
-		return con.newOpErrWasClosed("SetDeadline")
+		return con.opErr("SetDeadline", errWasClosed)
 	}
 	dur := t.Sub(time.Now())
 	con.recvTimeout = dur
@@ -323,7 +324,7 @@ func (con *Conn) SetDeadline(t time.Time) error {
 
 func (con *Conn) writeUS(b []byte, count int) (int, error) {
 	if con.closeState > 1 {
-		return 0, con.newOpErrWasClosed("writeUS")
+		return 0, errWasClosed
 	}
 
 	con.lastSendTime = time.Now()
@@ -383,9 +384,9 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 	for {
 		if con.closeState > 1 {
 			if con.resendPktErr != nil {
-				return con.opErr("sendUS", con.resendPktErr)
+				return con.resendPktErr
 			}
-			return con.newOpErrWasClosed("sendUS")
+			return errWasClosed
 		}
 
 		if con.resendPktsSize < resendPktsSizeMax {
@@ -502,7 +503,7 @@ func (con *Conn) flushUS() error {
 			if con.resendPktErr != nil {
 				return con.resendPktErr
 			}
-			return con.newOpErrWasClosed("flushUS")
+			return errWasClosed
 		}
 		if len(con.resendPkts) == 0 {
 			return nil
@@ -520,15 +521,15 @@ func (con *Conn) Flush() error {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
-	return con.flushUS()
+	return con.opErr("Flush", con.flushUS())
 }
 
-func (con *Conn) UnreliableSend(data []byte) error {
-	return con.send(pktUnreliableData, data)
+func (con *Conn) UnreliableSend(data []byte) (err error) {
+	return con.opErr("UnreliableSend", con.send(pktUnreliableData, data))
 }
 
 func (con *Conn) Send(data []byte) error {
-	return con.send(pktData, data)
+	return con.opErr("Send", con.send(pktData, data))
 }
 
 func (con *Conn) updateRTTAndSPSCUS(rtt time.Duration, sentPktSendCount int) {
@@ -635,7 +636,7 @@ func (con *Conn) Write(b []byte) (int, error) {
 		con.wStrmPktCount++
 		err := con.send(pktStreamData, con.wStrmPktCount, data)
 		if err != nil {
-			return 0, err
+			return 0, con.opErr("Write", err)
 		}
 		sz += len(data)
 	}

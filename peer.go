@@ -20,20 +20,21 @@ type Peer struct {
 	wasClosed bool
 }
 
-func (pr *Peer) newOpErr(op, errStr string) error {
-	return &net.OpError{Op: "", Net: "p90", Source: pr.Addr(), Addr: nil, Err: errors.New(errStr)}
+func (pr *Peer) opErr(op string, srcErr error) error {
+	if srcErr == nil {
+		return nil
+	}
+	return &net.OpError{Op: op, Net: "p90", Source: pr.Addr(), Addr: nil, Err: srcErr}
 }
 
-func (pr *Peer) newOpErrWasClosed(op string) error {
-	return pr.newOpErr(op, "was closed")
-}
+var errPeerWasClosed = errors.New("peer was closed")
 
 func (pr *Peer) writeTo(b []byte, addr net.Addr) (int, error) {
 	pr.mtx.Lock()
 	defer pr.mtx.Unlock()
 
 	if pr.wasClosed {
-		return 0, pr.newOpErrWasClosed("writeTo")
+		return 0, errPeerWasClosed
 	}
 	return pr.locLnr.WriteTo(b, addr)
 }
@@ -159,7 +160,7 @@ func (pr *Peer) DialAddr(addr net.Addr) (*Conn, error) {
 	defer pr.mtx.Unlock()
 
 	if pr.wasClosed {
-		return nil, pr.newOpErrWasClosed("DialAddr")
+		return nil, pr.opErr("DialAddr", errPeerWasClosed)
 	}
 	return pr.dialAddrUS(addr)
 }
@@ -169,7 +170,7 @@ func (pr *Peer) Dial(addrStr string) (*Conn, error) {
 	defer pr.mtx.Unlock()
 
 	if pr.wasClosed {
-		return nil, pr.newOpErrWasClosed("Dial")
+		return nil, pr.opErr("Dial", errPeerWasClosed)
 	}
 	addr, err := ResolveAddr(pr.locLnr.LocalAddr().Network(), addrStr)
 	if err != nil {
@@ -211,22 +212,22 @@ func (pr *Peer) putAcpt(con *Conn) error {
 	defer pr.mtx.Unlock()
 
 	if pr.wasClosed {
-		return pr.newOpErrWasClosed("putAcpt")
+		return pr.opErr("putAcpt", errPeerWasClosed)
 	}
 	pr.acptCh <- con
 	return nil
 }
 
-func (pr *Peer) AcceptGatling() (*Conn, error) {
+func (pr *Peer) AcceptP90() (*Conn, error) {
 	con, ok := <-pr.acptCh
 	if !ok || con.IsClose() {
-		return nil, pr.newOpErrWasClosed("AcceptGatling")
+		return nil, pr.opErr("AcceptP90", errPeerWasClosed)
 	}
 	return con, nil
 }
 
 func (pr *Peer) Accept() (net.Conn, error) {
-	return pr.AcceptGatling()
+	return pr.AcceptP90()
 }
 
 func (pr *Peer) Addr() net.Addr {
@@ -238,7 +239,7 @@ func (pr *Peer) Close() error {
 	defer pr.mtx.Unlock()
 
 	if pr.wasClosed {
-		return pr.newOpErrWasClosed("Close")
+		return pr.opErr("Close", errPeerWasClosed)
 	}
 	pr.wasClosed = true
 
