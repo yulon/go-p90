@@ -8,7 +8,7 @@ const (
 	pktReceiveds
 	pktRequests
 	pktClosed
-	pktHeartbeat
+	pktHowAreYou
 	pktStreamData
 )
 
@@ -18,7 +18,7 @@ var isReliableType = []bool{
 	false, // pktReceiveds
 	false, // pktRequests
 	true,  // pktClosed
-	false, // pktHeartbeat
+	true,  // pktHowAreYou
 	true,  // pktStreamData
 }
 

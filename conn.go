@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -31,8 +32,9 @@ type Conn struct {
 	nowSentPktSendCount int
 	minRTT              time.Duration
 
-	lastSendTime time.Time
-	lastRecvTime time.Time
+	lastSendTime  time.Time
+	lastRecvTime  time.Time
+	isWaitingFine uint32
 
 	handshakeTimeout time.Duration
 	isHandshaked     bool
@@ -84,6 +86,7 @@ func newConn(id uuid.UUID, locPr *Peer, rmtAddr net.Addr) *Conn {
 		rmtAddr:                     rmtAddr,
 		nowRTT:                      DefaultRTT,
 		minRTT:                      DefaultRTT,
+		isWaitingFine:               0,
 		handshakeTimeout:            10 * time.Second,
 		sendTimeout:                 30 * time.Second,
 		recvTimeout:                 90 * time.Second,
@@ -94,22 +97,16 @@ func newConn(id uuid.UUID, locPr *Peer, rmtAddr net.Addr) *Conn {
 	return con
 }
 
-func (con *Conn) newErr(errStr string) error {
-	return errors.New("p90 connection (" + con.LocalAddr().String() + "->" + con.rmtAddr.String() + ") " + errStr)
+func (con *Conn) opErr(op string, srcErr error) error {
+	return &net.OpError{Op: op, Net: "p90", Source: con.LocalAddr(), Addr: con.rmtAddr, Err: srcErr}
 }
 
-func (con *Conn) newTimeoutErr(onWrite bool) error {
-	if !con.isHandshaked {
-		return con.newErr("handshaking timeout.")
-	}
-	if onWrite {
-		return con.newErr("sending someone packet timeout.")
-	}
-	return con.newErr("receiving timeout.")
+func (con *Conn) newOpErr(op, srcErrStr string) error {
+	return con.opErr(op, errors.New(srcErrStr))
 }
 
-func (con *Conn) newWasClosedErr() error {
-	return con.newErr("was closed.")
+func (con *Conn) newOpErrWasClosed(op string) error {
+	return con.newOpErr(op, "was closed")
 }
 
 func (con *Conn) closeUS(recvErr error) error {
@@ -117,7 +114,7 @@ func (con *Conn) closeUS(recvErr error) error {
 		return nil
 	}
 	if recvErr == nil {
-		recvErr = con.newErr("closed by local.")
+		recvErr = errors.New("closed by local")
 		if con.closeState > 0 {
 			for con.closeState == 1 {
 				con.flushUS()
@@ -216,7 +213,10 @@ func (con *Conn) handleRecvPacket(from net.Addr, to net.PacketConn, h *header, r
 	case pktRequests:
 
 	case pktClosed:
-		con.close(con.newErr("closed by remote."))
+		con.close(errors.New("closed by remote"))
+
+	case pktHowAreYou:
+		atomic.StoreUint32(&con.isWaitingFine, 0)
 
 	case pktStreamData:
 		var strmPktIx uint64
@@ -297,7 +297,7 @@ func (con *Conn) SetReadDeadline(t time.Time) error {
 	defer con.mtx.Unlock()
 
 	if con.closeState > 0 {
-		return con.newWasClosedErr()
+		return con.newOpErrWasClosed("SetReadDeadline")
 	}
 	con.recvTimeout = t.Sub(time.Now())
 	return nil
@@ -308,7 +308,7 @@ func (con *Conn) SetWriteDeadline(t time.Time) error {
 	defer con.mtx.Unlock()
 
 	if con.closeState > 0 {
-		return con.newWasClosedErr()
+		return con.newOpErrWasClosed("SetWriteDeadline")
 	}
 	con.sendTimeout = t.Sub(time.Now())
 	return nil
@@ -319,7 +319,7 @@ func (con *Conn) SetDeadline(t time.Time) error {
 	defer con.mtx.Unlock()
 
 	if con.closeState > 0 {
-		return con.newWasClosedErr()
+		return con.newOpErrWasClosed("SetDeadline")
 	}
 	dur := t.Sub(time.Now())
 	con.recvTimeout = dur
@@ -329,7 +329,7 @@ func (con *Conn) SetDeadline(t time.Time) error {
 
 func (con *Conn) writeUS(b []byte, count int) (int, error) {
 	if con.closeState > 1 {
-		return 0, con.newWasClosedErr()
+		return 0, con.newOpErrWasClosed("writeUS")
 	}
 
 	con.lastSendTime = time.Now()
@@ -389,9 +389,9 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 	for {
 		if con.closeState > 1 {
 			if con.resendPktErr != nil {
-				return con.resendPktErr
+				return con.opErr("sendUS", con.resendPktErr)
 			}
-			return con.newWasClosedErr()
+			return con.newOpErrWasClosed("sendUS")
 		}
 
 		if con.resendPktsSize < resendPktsSizeMax {
@@ -440,7 +440,11 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 			now := time.Now()
 			for _, rspc := range con.resendPkts {
 				if now.Sub(rspc.firstSendTime) > sendTimeout {
-					con.closeUS(con.newTimeoutErr(true))
+					if !con.isHandshaked {
+						con.closeUS(errors.New("handshaking timeout"))
+					} else {
+						con.closeUS(errors.New("sending a packet timeout"))
+					}
 					con.mtx.Unlock()
 					return
 				}
@@ -504,7 +508,7 @@ func (con *Conn) flushUS() error {
 			if con.resendPktErr != nil {
 				return con.resendPktErr
 			}
-			return con.newWasClosedErr()
+			return con.newOpErrWasClosed("flushUS")
 		}
 		if len(con.resendPkts) == 0 {
 			return nil
@@ -531,16 +535,6 @@ func (con *Conn) UnreliableSend(data []byte) error {
 
 func (con *Conn) Send(data []byte) error {
 	return con.send(pktData, data)
-}
-
-func (con *Conn) Pace() error {
-	con.mtx.Lock()
-	defer con.mtx.Unlock()
-
-	if time.Now().Sub(con.lastSendTime.Add(con.minRTT)) <= 0 {
-		return con.newErr("pacing interval too brief.")
-	}
-	return con.sendUS(pktHeartbeat)
 }
 
 func (con *Conn) updateRTTAndSPSCUS(rtt time.Duration, sentPktSendCount int) {
@@ -646,7 +640,7 @@ func (con *Conn) Recv() ([]byte, error) {
 			con.recvPktCache = con.recvPktCache[1:]
 			return data, nil
 		} else if con.recvPktErr != nil {
-			return nil, con.recvPktErr
+			return nil, con.opErr("Recv", con.recvPktErr)
 		}
 		if con.recvPktCond == nil {
 			con.recvPktCond = sync.NewCond(&con.recvPktMtx)
@@ -719,7 +713,7 @@ func (con *Conn) Read(b []byte) (int, error) {
 			}
 			return sz, nil
 		} else if con.rStrmErr != nil {
-			return 0, con.rStrmErr
+			return 0, con.opErr("Read", con.rStrmErr)
 		}
 		if con.rStrmCond == nil {
 			con.rStrmCond = sync.NewCond(&con.rStrmMtx)

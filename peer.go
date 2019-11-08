@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,12 +20,12 @@ type Peer struct {
 	wasClosed bool
 }
 
-func (pr *Peer) newErr(errStr string) error {
-	return errors.New("p90 peer (" + pr.Addr().String() + ") " + errStr)
+func (pr *Peer) newOpErr(op, errStr string) error {
+	return &net.OpError{Op: "", Net: "p90", Source: pr.Addr(), Addr: nil, Err: errors.New(errStr)}
 }
 
-func (pr *Peer) newWasClosedErr() error {
-	return pr.newErr("was closed.")
+func (pr *Peer) newOpErrWasClosed(op string) error {
+	return pr.newOpErr(op, "was closed")
 }
 
 func (pr *Peer) writeTo(b []byte, addr net.Addr) (int, error) {
@@ -32,7 +33,7 @@ func (pr *Peer) writeTo(b []byte, addr net.Addr) (int, error) {
 	defer pr.mtx.Unlock()
 
 	if pr.wasClosed {
-		return 0, pr.newWasClosedErr()
+		return 0, pr.newOpErrWasClosed("writeTo")
 	}
 	return pr.locLnr.WriteTo(b, addr)
 }
@@ -99,12 +100,18 @@ func listen(pktCon net.PacketConn, isUnique bool) (*Peer, error) {
 			now := time.Now()
 			pr.conMap.Range(func(_, v interface{}) bool {
 				con := v.(*Conn)
+
+				if atomic.LoadUint32(&con.isWaitingFine) != 0 {
+					return true
+				}
+
 				con.mtx.Lock()
 				defer con.mtx.Unlock()
 
 				diff := now.Sub(con.lastRecvTime)
 				if diff > con.recvTimeout {
-					con.closeUS(con.newTimeoutErr(false))
+					atomic.StoreUint32(&con.isWaitingFine, 1)
+					con.sendUS(pktHowAreYou)
 					return true
 				}
 				if diff < dur {
@@ -152,7 +159,7 @@ func (pr *Peer) DialAddr(addr net.Addr) (*Conn, error) {
 	defer pr.mtx.Unlock()
 
 	if pr.wasClosed {
-		return nil, pr.newWasClosedErr()
+		return nil, pr.newOpErrWasClosed("DialAddr")
 	}
 	return pr.dialAddrUS(addr)
 }
@@ -162,7 +169,7 @@ func (pr *Peer) Dial(addrStr string) (*Conn, error) {
 	defer pr.mtx.Unlock()
 
 	if pr.wasClosed {
-		return nil, pr.newWasClosedErr()
+		return nil, pr.newOpErrWasClosed("Dial")
 	}
 	addr, err := ResolveAddr(pr.locLnr.LocalAddr().Network(), addrStr)
 	if err != nil {
@@ -204,7 +211,7 @@ func (pr *Peer) putAcpt(con *Conn) error {
 	defer pr.mtx.Unlock()
 
 	if pr.wasClosed {
-		return pr.newWasClosedErr()
+		return pr.newOpErrWasClosed("putAcpt")
 	}
 	pr.acptCh <- con
 	return nil
@@ -213,7 +220,7 @@ func (pr *Peer) putAcpt(con *Conn) error {
 func (pr *Peer) AcceptGatling() (*Conn, error) {
 	con, ok := <-pr.acptCh
 	if !ok || con.IsClose() {
-		return nil, pr.newWasClosedErr()
+		return nil, pr.newOpErrWasClosed("AcceptGatling")
 	}
 	return con, nil
 }
@@ -231,7 +238,7 @@ func (pr *Peer) Close() error {
 	defer pr.mtx.Unlock()
 
 	if pr.wasClosed {
-		return pr.newWasClosedErr()
+		return pr.newOpErrWasClosed("Close")
 	}
 	pr.wasClosed = true
 
