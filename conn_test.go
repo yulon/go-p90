@@ -69,4 +69,6 @@ func TestConn(*testing.T) {
 		panic(err)
 	}
 	fmt.Println("client read:", string(data))
+
+	con.Close()
 }

@@ -6,8 +6,6 @@ import (
 	"errors"
 	"net"
 	"sync"
-	"sync/atomic"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -39,11 +37,21 @@ func (pr *Peer) writeTo(b []byte, addr net.Addr) (int, error) {
 	return pr.locLnr.WriteTo(b, addr)
 }
 
+func (pr *Peer) tryRespCloseTo(addr net.Addr, h *header) bool {
+	if h.PktType != ptClose {
+		return false
+	}
+	h.PktType = ptReceiveds
+	h.PktCount = 0
+	pr.writeTo(makePacket(h), addr)
+	return true
+}
+
 func (pr *Peer) bypassRecvPacket(from net.Addr, to net.PacketConn, h *header, p []byte) {
 	r := bytes.NewBuffer(p)
 	err := binary.Read(r, binary.LittleEndian, h)
 
-	if err != nil || h.MagNum != MagicNumber || int(h.Type) >= len(isReliableType) {
+	if err != nil || h.MagNum != MagicNumber || int(h.PktType) >= len(isReliablePT) {
 		return
 	}
 
@@ -51,29 +59,28 @@ func (pr *Peer) bypassRecvPacket(from net.Addr, to net.PacketConn, h *header, p 
 	v, ok := pr.conMap.Load(h.ConID)
 	if ok {
 		con = v.(*Conn)
-		con.updateRecvInfo(from)
 	} else {
+		if pr.tryRespCloseTo(from, h) {
+			return
+		}
 		if pr.acptCh == nil {
 			return
 		}
-
 		con = newConn(h.ConID, pr, from)
-		con.updateRecvInfo(from)
-
 		actual, loaded := pr.conMap.LoadOrStore(h.ConID, con)
 		if loaded {
 			con = actual.(*Conn)
-			con.updateRecvInfo(from)
 		} else {
-			err = pr.putAcpt(con)
+			err := pr.putAcpt(con)
 			if err != nil {
-				con.closeUS(err)
+				con.close(err)
 				return
 			}
 		}
 	}
-	con.handleRecvPacket(from, to, h, r)
-	return
+	if con.addRecvOp(from, h, r.Bytes()) != nil {
+		pr.tryRespCloseTo(from, h)
+	}
 }
 
 func listen(pktCon net.PacketConn, isUnique bool) (*Peer, error) {
@@ -85,43 +92,13 @@ func listen(pktCon net.PacketConn, isUnique bool) (*Peer, error) {
 	}
 	go func() {
 		var h header
-		b := make([]byte, 1280)
+		b := make([]byte, 4096)
 		for {
 			sz, addr, err := pktCon.ReadFrom(b)
 			if err != nil {
 				return
 			}
 			pr.bypassRecvPacket(addr, pktCon, &h, b[:sz])
-		}
-	}()
-	go func() {
-		for {
-			dur := 90 * time.Second
-
-			now := time.Now()
-			pr.conMap.Range(func(_, v interface{}) bool {
-				con := v.(*Conn)
-
-				if atomic.LoadUint32(&con.isWaitingFine) != 0 {
-					return true
-				}
-
-				con.mtx.Lock()
-				defer con.mtx.Unlock()
-
-				diff := now.Sub(con.lastRecvTime)
-				if diff > con.recvTimeout {
-					atomic.StoreUint32(&con.isWaitingFine, 1)
-					con.sendUS(pktHowAreYou)
-					return true
-				}
-				if diff < dur {
-					dur = diff
-				}
-				return true
-			})
-
-			time.Sleep(dur)
 		}
 	}()
 	return pr, nil
@@ -152,7 +129,9 @@ func (pr *Peer) dialAddrUS(addr net.Addr) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newConn(id, pr, addr), nil
+	con := newConn(id, pr, addr)
+	pr.conMap.LoadOrStore(id, con)
+	return con, nil
 }
 
 func (pr *Peer) DialAddr(addr net.Addr) (*Conn, error) {
@@ -219,11 +198,7 @@ func (pr *Peer) putAcpt(con *Conn) error {
 }
 
 func (pr *Peer) AcceptP90() (*Conn, error) {
-	con, ok := <-pr.acptCh
-	if !ok || con.IsClose() {
-		return nil, pr.opErr("AcceptP90", errPeerWasClosed)
-	}
-	return con, nil
+	return <-pr.acptCh, nil
 }
 
 func (pr *Peer) Accept() (net.Conn, error) {

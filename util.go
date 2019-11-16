@@ -4,25 +4,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	"net"
+	"sync/atomic"
+	"time"
 )
 
-func makeData(others ...interface{}) []byte {
-	buf := bytes.NewBuffer([]byte{})
-	for _, other := range others {
-		switch other.(type) {
-		case nil:
-		case []byte:
-			buf.Write(other.([]byte))
-		default:
-			binary.Write(buf, binary.LittleEndian, other)
-		}
-	}
-	return buf.Bytes()
-}
-
-func makePacket(h *header, others ...interface{}) []byte {
-	buf := bytes.NewBuffer([]byte{})
-	binary.Write(buf, binary.LittleEndian, h)
+func writeData(buf *bytes.Buffer, others ...interface{}) {
 	for _, other := range others {
 		switch other.(type) {
 		case nil:
@@ -33,6 +19,22 @@ func makePacket(h *header, others ...interface{}) []byte {
 			binary.Write(buf, binary.LittleEndian, other)
 		}
 	}
+}
+
+func makeData(others ...interface{}) []byte {
+	buf := bytes.NewBuffer(nil)
+	writeData(buf, others...)
+	return buf.Bytes()
+}
+
+func writePacket(buf *bytes.Buffer, h *header, others ...interface{}) {
+	binary.Write(buf, binary.LittleEndian, h)
+	writeData(buf, others...)
+}
+
+func makePacket(h *header, others ...interface{}) []byte {
+	buf := bytes.NewBuffer(nil)
+	writePacket(buf, h, others...)
 	return buf.Bytes()
 }
 
@@ -72,4 +74,45 @@ func ResolveAddr(network, addrStr string) (net.Addr, error) {
 		return nil, net.UnknownNetworkError(network)
 	}
 	return net.ResolveUnixAddr(network, addrStr)
+}
+
+type atomicTime struct {
+	val int64
+}
+
+func newAtomicTime(t time.Time) *atomicTime {
+	return &atomicTime{t.Unix()}
+}
+
+func (at *atomicTime) Set(t time.Time) {
+	atomic.StoreInt64(&at.val, t.Unix())
+}
+
+func (at *atomicTime) Get() time.Time {
+	return time.Unix(atomic.LoadInt64(&at.val), 0)
+}
+
+type atomicDur struct {
+	val int64
+}
+
+func newAtomicDur(d time.Duration) *atomicDur {
+	return &atomicDur{int64(d)}
+}
+
+func (ad *atomicDur) Set(d time.Duration) {
+	atomic.StoreInt64(&ad.val, int64(d))
+}
+
+func (ad *atomicDur) Get() time.Duration {
+	return time.Duration(atomic.LoadInt64(&ad.val))
+}
+
+var endOfTimeTick = make(chan time.Time, 1)
+
+func getTick(tick <-chan time.Time) <-chan time.Time {
+	if tick == nil {
+		return endOfTimeTick
+	}
+	return tick
 }

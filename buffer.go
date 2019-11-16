@@ -5,17 +5,17 @@ import (
 	"sync"
 )
 
-type packetBufferBase struct {
+type readBufferBase struct {
 	err  error
 	mtx  sync.Mutex
 	cond *sync.Cond
 }
 
-func (pbb *packetBufferBase) wBegin() {
+func (pbb *readBufferBase) wBegin() {
 	pbb.mtx.Lock()
 }
 
-func (pbb *packetBufferBase) wDone() {
+func (pbb *readBufferBase) wDone() {
 	if pbb.cond != nil {
 		pbb.mtx.Unlock()
 		pbb.cond.Broadcast()
@@ -24,34 +24,34 @@ func (pbb *packetBufferBase) wDone() {
 	pbb.mtx.Unlock()
 }
 
-func (pbb *packetBufferBase) rBegin() {
+func (pbb *readBufferBase) rBegin() {
 	pbb.mtx.Lock()
 }
 
-func (pbb *packetBufferBase) rDone() {
+func (pbb *readBufferBase) rDone() {
 	pbb.mtx.Unlock()
 }
 
-func (pbb *packetBufferBase) waitForWrite() {
+func (pbb *readBufferBase) waitForWrite() {
 	if pbb.cond == nil {
 		pbb.cond = sync.NewCond(&pbb.mtx)
 	}
 	pbb.cond.Wait()
 }
 
-func (pbb *packetBufferBase) Close(err error) {
+func (pbb *readBufferBase) Close(err error) {
 	pbb.wBegin()
 	defer pbb.wDone()
 
 	pbb.err = err
 }
 
-type packetBuffer struct {
-	packetBufferBase
+type dataReadBuffer struct {
+	readBufferBase
 	pkts [][]byte
 }
 
-func (pb *packetBuffer) Put(pkt []byte) {
+func (pb *dataReadBuffer) Put(pkt []byte) {
 	pb.wBegin()
 	defer pb.wDone()
 
@@ -60,7 +60,7 @@ func (pb *packetBuffer) Put(pkt []byte) {
 	pb.pkts = append(pb.pkts, dataCpy)
 }
 
-func (pb *packetBuffer) Get() ([]byte, error) {
+func (pb *dataReadBuffer) Get() ([]byte, error) {
 	pb.rBegin()
 	defer pb.rDone()
 
@@ -76,18 +76,18 @@ func (pb *packetBuffer) Get() ([]byte, error) {
 	}
 }
 
-type streamPacketBuffer struct {
-	packetBufferBase
+type streamReadBuffer struct {
+	readBufferBase
 	sor *sorter
 	buf *bytes.Buffer
 }
 
-func (spb *streamPacketBuffer) Put(ix uint64, pkt []byte) {
+func (spb *streamReadBuffer) Put(ix uint64, pkt []byte) {
 	spb.wBegin()
 	defer spb.wDone()
 
 	if spb.buf == nil {
-		spb.buf = bytes.NewBuffer([]byte{})
+		spb.buf = bytes.NewBuffer(nil)
 		spb.sor = newSorter(nil, func(datas []indexedData) {
 			for _, data := range datas {
 				spb.buf.Write(data.val.([]byte))
@@ -99,7 +99,7 @@ func (spb *streamPacketBuffer) Put(ix uint64, pkt []byte) {
 	}
 }
 
-func (spb *streamPacketBuffer) Read(data []byte) (int, error) {
+func (spb *streamReadBuffer) Read(data []byte) (int, error) {
 	spb.rBegin()
 	defer spb.rDone()
 
