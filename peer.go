@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -47,7 +48,7 @@ func (pr *Peer) tryRespCloseTo(addr net.Addr, h *header) bool {
 	return true
 }
 
-func (pr *Peer) bypassRecvPacket(from net.Addr, to net.PacketConn, h *header, p []byte) {
+func (pr *Peer) bypassRecv(from net.Addr, to net.PacketConn, h *header, p []byte) {
 	r := bytes.NewBuffer(p)
 	err := binary.Read(r, binary.LittleEndian, h)
 
@@ -78,7 +79,7 @@ func (pr *Peer) bypassRecvPacket(from net.Addr, to net.PacketConn, h *header, p 
 			}
 		}
 	}
-	if con.addRecvOp(from, h, r.Bytes()) != nil {
+	if con.handleRecv(from, h, r) != nil {
 		pr.tryRespCloseTo(from, h)
 	}
 }
@@ -98,7 +99,23 @@ func listen(pktCon net.PacketConn, isUnique bool) (*Peer, error) {
 			if err != nil {
 				return
 			}
-			pr.bypassRecvPacket(addr, pktCon, &h, b[:sz])
+			pr.bypassRecv(addr, pktCon, &h, b[:sz])
+		}
+	}()
+	go func() {
+		for {
+			dur := 90 * time.Second
+
+			pr.conMap.Range(func(_, v interface{}) bool {
+				con := v.(*Conn)
+				d := con.handleRTimeout()
+				if d > 0 && d < dur {
+					dur = d
+				}
+				return true
+			})
+
+			time.Sleep(dur)
 		}
 	}()
 	return pr, nil
@@ -124,7 +141,7 @@ func Listen(addrStr string) (*Peer, error) {
 	return ListenUDP(udpAddr)
 }
 
-func (pr *Peer) dialAddrUS(addr net.Addr) (*Conn, error) {
+func (pr *Peer) dial(addr net.Addr) (*Conn, error) {
 	id, err := uuid.NewUUID()
 	if err != nil {
 		return nil, err
@@ -141,7 +158,7 @@ func (pr *Peer) DialAddr(addr net.Addr) (*Conn, error) {
 	if pr.wasClosed {
 		return nil, pr.opErr("DialAddr", errPeerWasClosed)
 	}
-	return pr.dialAddrUS(addr)
+	return pr.dial(addr)
 }
 
 func (pr *Peer) Dial(addrStr string) (*Conn, error) {
@@ -155,7 +172,7 @@ func (pr *Peer) Dial(addrStr string) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pr.dialAddrUS(addr)
+	return pr.dial(addr)
 }
 
 func DialAddr(locPktCon net.PacketConn, rmtAddr net.Addr) (*Conn, error) {

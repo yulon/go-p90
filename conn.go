@@ -20,7 +20,6 @@ type recvData struct {
 // conn state
 const (
 	csNormal byte = iota
-	csFlushing
 	csClosing
 	csClosed
 )
@@ -28,22 +27,22 @@ const (
 type Conn struct {
 	id uuid.UUID
 
-	locPr      *Peer
-	rmtAddr    net.Addr
-	rmtAddrMtx sync.Mutex
+	locPr   *Peer
+	rmtAddr net.Addr
+	mtx     sync.Mutex
+
+	state byte
 
 	handshakeTimeout *atomicDur
 	isHandshaked     bool
 
-	wTimeout     *atomicDur
-	wTimeoutTick <-chan time.Time
+	wTimeout      *atomicDur
+	rTimeout      *atomicDur
+	isWaitingFine uintptr
 
-	rTimeout     *atomicDur
-	rTimeoutTick <-chan time.Time
-
-	nowRTT              *atomicDur
-	nowSentPktSendCount uintptr
-	minRTT              *atomicDur
+	nowRTT  *atomicDur
+	nowRTSC uintptr
+	minRTT  *atomicDur
 
 	wLastTime *atomicTime
 	rLastTime *atomicTime
@@ -53,8 +52,13 @@ type Conn struct {
 	cWnd        []*sendPktCtx
 	cWndSize    int
 	cWndSizeMax int
+	cWndOnPush  *sync.Cond
+	cWndOnPop   *sync.Cond
+	cWndErr     error
 
-	sentPktSorter *sorter
+	sentPktSorter    *sorter
+	someoneSentPktID uint64
+	someonePktSentTS time.Time
 
 	rPktSorter *sorter
 
@@ -63,16 +67,10 @@ type Conn struct {
 	wStrmCount uint64
 	wStrmMtx   sync.Mutex
 	rStrmBuf   streamReadBuffer
-
-	wBufOut chan *bytes.Buffer
-	rBufOut chan *bytes.Buffer
-	opIn    chan interface{}
-	errOut  chan error
 }
 
 func newConn(id uuid.UUID, locPr *Peer, rmtAddr net.Addr) *Conn {
 	now := time.Now()
-
 	con := &Conn{
 		id:               id,
 		locPr:            locPr,
@@ -81,23 +79,16 @@ func newConn(id uuid.UUID, locPr *Peer, rmtAddr net.Addr) *Conn {
 		minRTT:           newAtomicDur(DefaultRTT),
 		handshakeTimeout: newAtomicDur(10 * time.Second),
 		wTimeout:         newAtomicDur(30 * time.Second),
-		rTimeout:         newAtomicDur(60 * time.Second),
+		rTimeout:         newAtomicDur(90 * time.Second),
 		rLastTime:        newAtomicTime(now),
 		wLastTime:        newAtomicTime(now),
 		cWndSizeMax:      2048 * 1024,
 		sentPktSorter:    newSorter(nil, nil),
 		rPktSorter:       newSorter(nil, nil),
-		rBufOut:          make(chan *bytes.Buffer, 1),
-		wBufOut:          make(chan *bytes.Buffer, 1),
-		opIn:             make(chan interface{}, 1),
-		errOut:           make(chan error, 1),
 	}
-
-	con.rBufOut <- bytes.NewBuffer(nil)
-	con.wBufOut <- bytes.NewBuffer(nil)
-
-	go con.handleOps()
-
+	con.cWndOnPush = sync.NewCond(&con.mtx)
+	con.cWndOnPop = sync.NewCond(&con.mtx)
+	go con.loopHandleWTimeout()
 	return con
 }
 
@@ -108,204 +99,170 @@ func (con *Conn) opErr(op string, srcErr error) error {
 	return &net.OpError{Op: op, Net: "p90", Source: con.LocalAddr(), Addr: con.rmtAddr, Err: srcErr}
 }
 
-func (con *Conn) setRemoteAddr(addr net.Addr) {
-	con.rmtAddrMtx.Lock()
-	defer con.rmtAddrMtx.Unlock()
-
-	con.rmtAddr = addr
-}
-
-func (con *Conn) getBuf(out chan *bytes.Buffer) (*bytes.Buffer, error) {
-	select {
-	case buf := <-out:
-		return buf, nil
-	case err := <-con.errOut:
-		con.errOut <- err
-		return nil, err
-	}
-}
-
-func (con *Conn) putBuf(out chan *bytes.Buffer, buf *bytes.Buffer) {
-	buf.Reset()
-	out <- buf
-}
-
-func (con *Conn) getRBuf() (*bytes.Buffer, error) {
-	return con.getBuf(con.rBufOut)
-}
-
-func (con *Conn) putRBuf(buf *bytes.Buffer) {
-	con.putBuf(con.rBufOut, buf)
-}
-
-func (con *Conn) getWBuf() (*bytes.Buffer, error) {
-	return con.getBuf(con.wBufOut)
-}
-
-func (con *Conn) putWBuf(buf *bytes.Buffer) {
-	con.putBuf(con.wBufOut, buf)
-}
-
 var errWasClosed = errors.New("was closed")
-
+var errClosingByLocal = errors.New("closing by local")
 var errClosedByLocal = errors.New("closed by local")
+var errClosedByRemote = errors.New("closed by remote")
 
-func (con *Conn) close(reason error) {
+func (con *Conn) close(reason error) error {
+	if con.state == csClosed {
+		panic(con.state)
+	}
+	con.state = csClosed
+
 	con.locPr.conMap.Delete(con.id)
 	if con.locPr.acptCh == nil {
 		con.locPr.Close()
 	}
-	con.errOut <- reason
+
+	con.cWndErr = reason
+	con.cWndOnPop.Broadcast()
+	con.cWndOnPush.Signal()
+
 	con.rDataBuf.Close(reason)
 	con.rStrmBuf.Close(reason)
+	return nil
 }
 
-type closeInfo struct {
-	wBuf *bytes.Buffer
-}
-
-func (con *Conn) handleClose(ci closeInfo) error {
-	err := con.flush()
-	if err != nil {
-		return err
+func (con *Conn) checkCloseErr() error {
+	if con.state == csClosed {
+		return errWasClosed
 	}
-	err = con.send(ptClose)
-	if err != nil {
-		return err
-	}
-	err = con.flush()
-	if err != nil {
-		return err
-	}
-	return errClosedByLocal
-}
-
-func (con *Conn) addCloseOp() error {
-	wBuf, err := con.getWBuf()
-	if err != nil {
-		return err
-	}
-	con.opIn <- closeInfo{
-		wBuf: wBuf,
+	if con.state == csClosing {
+		return errClosingByLocal
 	}
 	return nil
 }
 
 func (con *Conn) Close() error {
-	err := con.addCloseOp()
-	if err == nil {
-		err = <-con.errOut
-		con.errOut <- err
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	if con.state == csClosed {
+		return con.opErr("Close", errWasClosed)
 	}
-	if err != errClosedByLocal {
-		return err
+	if con.state == csClosing {
+		err := con.flush(true)
+		if err != nil && err != errClosedByLocal {
+			return con.opErr("Close", err)
+		}
+		return nil
 	}
-	return nil
+	con.state = csClosing
+	err := con.flush(true)
+	if err != nil {
+		return con.opErr("Close", err)
+	}
+	err = con.send(ptClose)
+	if err != nil {
+		return con.opErr("Close", err)
+	}
+	err = con.flush(true)
+	if err != nil {
+		return con.opErr("Close", err)
+	}
+	return con.close(errClosedByLocal)
 }
 
-type recvInfo struct {
-	from     net.Addr
-	h        header
-	rDataBuf *bytes.Buffer
-}
+func (con *Conn) handleRecv(from net.Addr, h *header, r *bytes.Buffer) error {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
 
-var errClosedByRemote = errors.New("closed by remote")
+	if con.state == csClosed {
+		return errWasClosed
+	}
 
-func (con *Conn) handleRecv(ri recvInfo) error {
 	con.rLastTime.Set(time.Now())
+	if atomic.LoadUintptr(&con.isWaitingFine) != 0 {
+		atomic.StoreUintptr(&con.isWaitingFine, 0)
+	}
 
-	con.setRemoteAddr(ri.from)
+	con.rmtAddr = from
 
 	if !con.isHandshaked {
 		con.isHandshaked = true
 	}
 
-	if con.rTimeoutTick == nil {
-		con.rTimeoutTick = time.Tick(con.rTimeout.Get())
-	}
-
-	if isReliablePT[ri.h.PktType] && ri.h.PktCount > 0 {
-		err := con.send(ptReceiveds, ri.h.PktCount)
+	if isReliablePT[h.PktType] && h.PktCount > 0 {
+		err := con.send(ptReceiveds, h.PktCount)
 		if err != nil {
 			return err
 		}
-		if !con.rPktSorter.TryAdd(ri.h.PktCount, nil) {
-			con.putRBuf(ri.rDataBuf)
+		if !con.rPktSorter.TryAdd(h.PktCount, nil) {
 			return nil
 		}
 	}
 
-	switch ri.h.PktType {
+	switch h.PktType {
 
 	case ptData:
 		fallthrough
 	case ptUnreliableData:
-		con.rDataBuf.Put(ri.rDataBuf.Bytes())
+		con.rDataBuf.Put(r.Bytes())
 
 	case ptReceiveds:
-		pktIDs := make([]uint64, ri.rDataBuf.Len()/8)
-		binary.Read(ri.rDataBuf, binary.LittleEndian, &pktIDs)
+		pktIDs := make([]uint64, r.Len()/8)
+		binary.Read(r, binary.LittleEndian, &pktIDs)
 		err := con.cleanCWnd(pktIDs...)
 		if err != nil {
+			con.close(err)
 			return err
 		}
 
 	case ptRequests:
 
 	case ptClose:
-		return errClosedByRemote
+		err := con.close(errClosedByRemote)
+		if err != nil {
+			return err
+		}
 
 	case ptStreamData:
 		var strmPktIx uint64
-		binary.Read(ri.rDataBuf, binary.LittleEndian, &strmPktIx)
-		con.rStrmBuf.Put(strmPktIx, ri.rDataBuf.Bytes())
+		binary.Read(r, binary.LittleEndian, &strmPktIx)
+		con.rStrmBuf.Put(strmPktIx, r.Bytes())
 	}
 
-	con.putRBuf(ri.rDataBuf)
 	return nil
 }
 
-func (con *Conn) addRecvOp(from net.Addr, h *header, body []byte) error {
-	rDataBuf, err := con.getRBuf()
-	if err != nil {
-		return err
-	}
-	rDataBuf.Write(body)
-	con.opIn <- recvInfo{
-		from:     from,
-		h:        *h,
-		rDataBuf: rDataBuf,
-	}
-	return nil
+func (con *Conn) Recv() ([]byte, error) {
+	pkt, err := con.rDataBuf.Get()
+	return pkt, con.opErr("Recv", err)
 }
 
-func (con *Conn) Recv() (pkt []byte, err error) {
-	pkt, err = con.rDataBuf.Get()
-	if err != nil {
-		err = con.opErr("Recv", err)
-	}
-	return
+func (con *Conn) Read(b []byte) (int, error) {
+	n, err := con.rStrmBuf.Read(b)
+	return n, con.opErr("Read", err)
 }
 
-func (con *Conn) Read(b []byte) (n int, err error) {
-	n, err = con.rStrmBuf.Read(b)
-	if err != nil {
-		err = con.opErr("Read", err)
+func (con *Conn) handleRTimeout() time.Duration {
+	if atomic.LoadUintptr(&con.isWaitingFine) != 0 && atomic.SwapUintptr(&con.isWaitingFine, 1) != 0 {
+		return -1
 	}
-	return
-}
 
-func (con *Conn) handleRTimeout() error {
-	rTimeout := con.rTimeout.Get()
+	wto := con.wTimeout.Get()
+	rto := con.rTimeout.Get()
+	if wto > rto {
+		rto = 0
+	} else {
+		rto -= wto
+	}
+
 	now := time.Now()
 	ela := now.Sub(con.rLastTime.Get())
-	if ela < rTimeout {
-		con.rTimeoutTick = time.Tick(rTimeout - ela)
-		return nil
+	if ela < rto {
+		atomic.StoreUintptr(&con.isWaitingFine, 0)
+		return rto - ela
+	}
+
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+	if con.state > csNormal {
+		return -1
 	}
 	con.send(ptHowAreYou)
-	con.rTimeoutTick = nil
-	return nil
+	return -1
 }
 
 func (con *Conn) write(pkt []byte) error {
@@ -323,6 +280,10 @@ type sendPktCtx struct {
 }
 
 func (con *Conn) send(typ byte, others ...interface{}) error {
+	if con.state == csClosed {
+		panic(con.state)
+	}
+
 	isReliable := isReliablePT[typ]
 
 	if isReliable {
@@ -347,33 +308,47 @@ func (con *Conn) send(typ byte, others ...interface{}) error {
 		return nil
 	}
 
-	for con.cWndSize >= con.cWndSizeMax {
-		err := con.handleOp()
-		if err != nil {
-			return err
-		}
+	spc := &sendPktCtx{id: h.PktCount, pkt: pkt, wFirstTime: con.wLastTime.Get()}
+
+	err = con.flush(false)
+	if err != nil {
+		return err
 	}
 
-	ctx := &sendPktCtx{id: h.PktCount, pkt: pkt, wFirstTime: con.wLastTime.Get()}
-
-	con.cWnd = append(con.cWnd, ctx)
-	con.cWndSize += len(ctx.pkt)
-
-	if con.wTimeoutTick != nil {
+	if con.sentPktSorter.Has(h.PktCount) {
+		if h.PktCount == con.someoneSentPktID {
+			con.updateRTInfo(con.someonePktSentTS.Sub(spc.wFirstTime), spc.wCount)
+			con.someoneSentPktID = 0
+		}
 		return nil
 	}
-	con.wTimeoutTick = time.Tick(DefaultRTT)
+
+	con.cWnd = append(con.cWnd, spc)
+	con.cWndSize += len(spc.pkt)
+	con.cWndOnPush.Signal()
 	return nil
 }
 
-func (con *Conn) flush() error {
-	for con.cWndSize > 0 {
-		err := con.handleOp()
-		if err != nil {
-			return err
+func (con *Conn) isNeedFlushNow(isWantFlushAll bool) bool {
+	if isWantFlushAll {
+		return con.cWndSize > 0
+	}
+	return con.cWndSize >= con.cWndSizeMax
+}
+
+func (con *Conn) flush(isWantFlushAll bool) error {
+	for {
+		if con.state == csClosed {
+			panic(con.state)
+		}
+		if !con.isNeedFlushNow(isWantFlushAll) {
+			return nil
+		}
+		con.cWndOnPop.Wait()
+		if con.cWndErr != nil {
+			return con.cWndErr
 		}
 	}
-	return nil
 }
 
 func (con *Conn) resend(spc *sendPktCtx) error {
@@ -383,10 +358,9 @@ func (con *Conn) resend(spc *sendPktCtx) error {
 	return err
 }
 
-func (con *Conn) handleWTimeout() error {
+func (con *Conn) handleWTimeout() (time.Duration, error) {
 	if con.cWndSize == 0 {
-		con.wTimeoutTick = nil
-		return nil
+		return -1, nil
 	}
 
 	wTimeout := con.wTimeout
@@ -395,17 +369,17 @@ func (con *Conn) handleWTimeout() error {
 	}
 
 	durMax := con.minRTT.Get()
-	durMax += durMax / 4
+	durMax += durMax / 10
 	dur := durMax
+
 	now := time.Now()
 
 	for _, spc := range con.cWnd {
 		if now.Sub(spc.wFirstTime) > wTimeout.Get() {
-			con.wTimeoutTick = nil
 			if !con.isHandshaked {
-				return errors.New("handshaking timeout")
+				return -1, errors.New("handshaking timeout")
 			}
-			return errors.New("sending a packet timeout")
+			return -1, errors.New("sending a packet timeout")
 		}
 		ela := now.Sub(spc.wLastTime)
 		if ela < durMax {
@@ -417,12 +391,42 @@ func (con *Conn) handleWTimeout() error {
 		}
 		err := con.resend(spc)
 		if err != nil {
-			con.wTimeoutTick = nil
-			return err
+			return -1, err
 		}
 	}
-	con.wTimeoutTick = time.Tick(dur + dur/10)
-	return nil
+
+	return dur, nil
+}
+
+func (con *Conn) loopHandleWTimeout() {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+	for {
+		if con.state == csClosed {
+			return
+		}
+		dur, err := con.handleWTimeout()
+		if err != nil {
+			con.close(err)
+			return
+		}
+		if dur < 0 {
+			con.cWndOnPush.Wait()
+			continue
+		}
+		con.mtx.Unlock()
+		time.Sleep(dur)
+		con.mtx.Lock()
+	}
+}
+
+func (con *Conn) updateRTInfo(rtt time.Duration, wCount uintptr) {
+	con.nowRTT.Set(rtt)
+	minRTT := con.minRTT.Get()
+	if rtt < minRTT {
+		con.minRTT.Set(rtt)
+	}
+	atomic.SwapUintptr(&con.nowRTSC, wCount)
 }
 
 func (con *Conn) cleanCWnd(pktIDs ...uint64) error {
@@ -433,17 +437,10 @@ func (con *Conn) cleanCWnd(pktIDs ...uint64) error {
 			continue
 		}
 		isSent = true
+		isRm := false
 		for i, spc := range con.cWnd {
 			if spc.id == pktID {
-				nowRTT := now.Sub(spc.wFirstTime)
-				con.nowRTT.Set(nowRTT)
-
-				minRTT := con.minRTT.Get()
-				if nowRTT < minRTT {
-					con.minRTT.Set(nowRTT)
-				}
-
-				atomic.SwapUintptr(&con.nowSentPktSendCount, spc.wCount)
+				con.updateRTInfo(now.Sub(spc.wFirstTime), spc.wCount)
 
 				con.cWndSize -= len(spc.pkt)
 
@@ -462,46 +459,37 @@ func (con *Conn) cleanCWnd(pktIDs ...uint64) error {
 				break
 			}
 		}
+		if !isRm && con.someoneSentPktID == 0 {
+			con.someoneSentPktID = pktID
+			con.someonePktSentTS = now
+		}
 	}
-	if !isSent {
-		return nil
+	if isSent {
+		con.cWndOnPop.Broadcast()
 	}
-	if con.cWndSize == 0 {
-		con.wTimeoutTick = nil
-		return nil
-	}
-	return nil
-}
-
-type sendInfo struct {
-	typ byte
-	buf *bytes.Buffer
-}
-
-func (con *Conn) handleSend(inf sendInfo) error {
-	err := con.send(inf.typ, inf.buf.Bytes())
-	if err == nil {
-		con.putWBuf(inf.buf)
-	}
-	return err
-}
-
-func (con *Conn) addSendOp(typ byte, others ...interface{}) error {
-	wBuf, err := con.getWBuf()
-	if err != nil {
-		return err
-	}
-	writeData(wBuf, others...)
-	con.opIn <- sendInfo{typ: typ, buf: wBuf}
 	return nil
 }
 
 func (con *Conn) UnreliableSend(data []byte) error {
-	return con.opErr("UnreliableSend", con.addSendOp(ptUnreliableData, data))
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	err := con.checkCloseErr()
+	if err == nil {
+		err = con.send(ptUnreliableData, data)
+	}
+	return con.opErr("UnreliableSend", err)
 }
 
 func (con *Conn) Send(data []byte) error {
-	return con.opErr("Send", con.addSendOp(ptData, data))
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	err := con.checkCloseErr()
+	if err == nil {
+		err = con.send(ptData, data)
+	}
+	return con.opErr("Send", err)
 }
 
 func (con *Conn) Write(b []byte) (int, error) {
@@ -522,41 +510,23 @@ func (con *Conn) Write(b []byte) (int, error) {
 			b = nil
 		}
 		con.wStrmCount++
-		err := con.addSendOp(ptStreamData, con.wStrmCount, data)
+
+		con.mtx.Lock()
+
+		err := con.checkCloseErr()
 		if err != nil {
+			con.mtx.Unlock()
 			return 0, con.opErr("Write", err)
 		}
-		sz += len(data)
-	}
-}
-
-func (con *Conn) handleOp() error {
-	select {
-	case op := <-con.opIn:
-		switch op.(type) {
-		case recvInfo:
-			return con.handleRecv(op.(recvInfo))
-		case sendInfo:
-			return con.handleSend(op.(sendInfo))
-		case closeInfo:
-			return con.handleClose(op.(closeInfo))
-		default:
-			panic(op)
-		}
-	case <-getTick(con.wTimeoutTick):
-		return con.handleWTimeout()
-	case <-getTick(con.rTimeoutTick):
-		return con.handleRTimeout()
-	}
-}
-
-func (con *Conn) handleOps() {
-	for {
-		err := con.handleOp()
+		err = con.send(ptStreamData, con.wStrmCount, data)
 		if err != nil {
-			con.close(err)
-			return
+			con.mtx.Unlock()
+			return 0, con.opErr("Write", err)
 		}
+
+		con.mtx.Unlock()
+
+		sz += len(data)
 	}
 }
 
@@ -565,8 +535,8 @@ func (con *Conn) LocalAddr() net.Addr {
 }
 
 func (con *Conn) RemoteAddr() net.Addr {
-	con.rmtAddrMtx.Lock()
-	defer con.rmtAddrMtx.Unlock()
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
 
 	return con.rmtAddr
 }
@@ -580,7 +550,7 @@ func (con *Conn) RTT() time.Duration {
 }
 
 func (con *Conn) PacketLoss() float32 {
-	return float32(1) - float32(1)/float32(atomic.LoadUintptr(&con.nowSentPktSendCount))
+	return float32(1) - float32(1)/float32(atomic.LoadUintptr(&con.nowRTSC))
 }
 
 func (con *Conn) LastReadTime() time.Time {
@@ -600,27 +570,69 @@ func (con *Conn) LastActivityTime() time.Time {
 	return st
 }
 
-func (con *Conn) SetWriteTimeout(dur time.Duration) {
+func (con *Conn) SetWriteTimeout(dur time.Duration) error {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	err := con.checkCloseErr()
+	if err != nil {
+		return con.opErr("SetWriteTimeout", err)
+	}
+
 	con.wTimeout.Set(dur)
+	return nil
 }
 
-func (con *Conn) SetReadTimeout(dur time.Duration) {
+func (con *Conn) SetReadTimeout(dur time.Duration) error {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	err := con.checkCloseErr()
+	if err != nil {
+		return con.opErr("SetReadTimeout", err)
+	}
+
 	con.rTimeout.Set(dur)
-}
-
-func (con *Conn) SetReadDeadline(t time.Time) error {
-	con.rTimeout.Set(t.Sub(time.Now()))
 	return nil
 }
 
 func (con *Conn) SetWriteDeadline(t time.Time) error {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	err := con.checkCloseErr()
+	if err != nil {
+		return con.opErr("SetWriteDeadline", err)
+	}
+
 	con.wTimeout.Set(t.Sub(time.Now()))
 	return nil
 }
 
+func (con *Conn) SetReadDeadline(t time.Time) error {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	err := con.checkCloseErr()
+	if err != nil {
+		return con.opErr("SetReadDeadline", err)
+	}
+
+	con.rTimeout.Set(t.Sub(time.Now()))
+	return nil
+}
+
 func (con *Conn) SetDeadline(t time.Time) error {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	err := con.checkCloseErr()
+	if err != nil {
+		return con.opErr("SetDeadline", err)
+	}
+
 	dur := t.Sub(time.Now())
-	con.rTimeout.Set(dur)
 	con.wTimeout.Set(dur)
+	con.rTimeout.Set(dur)
 	return nil
 }

@@ -39,6 +39,9 @@ func TestConn(*testing.T) {
 		if err != nil {
 			panic(err)
 		}
+
+		fmt.Println("server close once:", con.Close())
+		fmt.Println("server close twice:", con.Close())
 	}()
 
 	con, err := Dial("127.0.0.1:8828")
@@ -70,5 +73,6 @@ func TestConn(*testing.T) {
 	}
 	fmt.Println("client read:", string(data))
 
-	con.Close()
+	fmt.Println("client close once:", con.Close())
+	fmt.Println("client close twice:", con.Close())
 }
