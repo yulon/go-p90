@@ -164,7 +164,7 @@ func (con *Conn) Close() error {
 	return con.close(errClosedByLocal)
 }
 
-func (con *Conn) handleRecv(from net.Addr, h *header, r *bytes.Buffer) error {
+func (con *Conn) handleRecv(from net.Addr, h *Header, r *bytes.Buffer) error {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
@@ -290,8 +290,8 @@ func (con *Conn) send(typ byte, others ...interface{}) error {
 		con.wPktCount++
 	}
 
-	h := header{
-		MagNum:   MagicNumber,
+	h := Header{
+		Checksum: MagicNumber,
 		ConID:    con.id,
 		PktCount: con.wPktCount,
 		PktType:  typ,

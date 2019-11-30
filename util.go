@@ -27,12 +27,13 @@ func makeData(others ...interface{}) []byte {
 	return buf.Bytes()
 }
 
-func writePacket(buf *bytes.Buffer, h *header, others ...interface{}) {
+func writePacket(buf *bytes.Buffer, h *Header, others ...interface{}) {
+	h.Checksum = GenHeaderChecksum(h)
 	binary.Write(buf, binary.LittleEndian, h)
 	writeData(buf, others...)
 }
 
-func makePacket(h *header, others ...interface{}) []byte {
+func makePacket(h *Header, others ...interface{}) []byte {
 	buf := bytes.NewBuffer(nil)
 	writePacket(buf, h, others...)
 	return buf.Bytes()
