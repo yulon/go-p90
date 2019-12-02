@@ -11,39 +11,46 @@ type readBufferBase struct {
 	cond *sync.Cond
 }
 
-func (pbb *readBufferBase) wBegin() {
-	pbb.mtx.Lock()
+func (rbb *readBufferBase) wBegin() bool {
+	rbb.mtx.Lock()
+	if rbb.err == nil {
+		return true
+	}
+	rbb.mtx.Unlock()
+	return false
 }
 
-func (pbb *readBufferBase) wDone() {
-	if pbb.cond != nil {
-		pbb.mtx.Unlock()
-		pbb.cond.Broadcast()
+func (rbb *readBufferBase) wDone() {
+	if rbb.cond != nil {
+		rbb.mtx.Unlock()
+		rbb.cond.Broadcast()
 		return
 	}
-	pbb.mtx.Unlock()
+	rbb.mtx.Unlock()
 }
 
-func (pbb *readBufferBase) rBegin() {
-	pbb.mtx.Lock()
+func (rbb *readBufferBase) rBegin() {
+	rbb.mtx.Lock()
 }
 
-func (pbb *readBufferBase) rDone() {
-	pbb.mtx.Unlock()
+func (rbb *readBufferBase) rDone() {
+	rbb.mtx.Unlock()
 }
 
-func (pbb *readBufferBase) waitForWrite() {
-	if pbb.cond == nil {
-		pbb.cond = sync.NewCond(&pbb.mtx)
+func (rbb *readBufferBase) waitForWrite() {
+	if rbb.cond == nil {
+		rbb.cond = sync.NewCond(&rbb.mtx)
 	}
-	pbb.cond.Wait()
+	rbb.cond.Wait()
 }
 
-func (pbb *readBufferBase) Close(err error) {
-	pbb.wBegin()
-	defer pbb.wDone()
+func (rbb *readBufferBase) Close(err error) {
+	if !rbb.wBegin() {
+		return
+	}
+	defer rbb.wDone()
 
-	pbb.err = err
+	rbb.err = err
 }
 
 type dataReadBuffer struct {
@@ -51,28 +58,30 @@ type dataReadBuffer struct {
 	pkts [][]byte
 }
 
-func (pb *dataReadBuffer) Put(pkt []byte) {
-	pb.wBegin()
-	defer pb.wDone()
+func (drb *dataReadBuffer) Put(pkt []byte) {
+	if !drb.wBegin() {
+		return
+	}
+	defer drb.wDone()
 
 	dataCpy := make([]byte, len(pkt))
 	copy(dataCpy, pkt)
-	pb.pkts = append(pb.pkts, dataCpy)
+	drb.pkts = append(drb.pkts, dataCpy)
 }
 
-func (pb *dataReadBuffer) Get() ([]byte, error) {
-	pb.rBegin()
-	defer pb.rDone()
+func (drb *dataReadBuffer) Get() ([]byte, error) {
+	drb.rBegin()
+	defer drb.rDone()
 
 	for {
-		if len(pb.pkts) > 0 {
-			data := pb.pkts[0]
-			pb.pkts = pb.pkts[1:]
+		if len(drb.pkts) > 0 {
+			data := drb.pkts[0]
+			drb.pkts = drb.pkts[1:]
 			return data, nil
-		} else if pb.err != nil {
-			return nil, pb.err
+		} else if drb.err != nil {
+			return nil, drb.err
 		}
-		pb.waitForWrite()
+		drb.waitForWrite()
 	}
 }
 
@@ -82,37 +91,39 @@ type streamReadBuffer struct {
 	buf *bytes.Buffer
 }
 
-func (spb *streamReadBuffer) Put(ix uint64, pkt []byte) {
-	spb.wBegin()
-	defer spb.wDone()
+func (srb *streamReadBuffer) Put(ix uint64, pkt []byte) {
+	if !srb.wBegin() {
+		return
+	}
+	defer srb.wDone()
 
-	if spb.buf == nil {
-		spb.buf = bytes.NewBuffer(nil)
-		spb.sor = newSorter(nil, func(datas []indexedData) {
+	if srb.buf == nil {
+		srb.buf = bytes.NewBuffer(nil)
+		srb.sor = newSorter(nil, func(datas []indexedData) {
 			for _, data := range datas {
-				spb.buf.Write(data.val.([]byte))
+				srb.buf.Write(data.val.([]byte))
 			}
 		})
 	}
-	if spb.sor.TryAdd(ix, pkt) == false {
+	if srb.sor.TryAdd(ix, pkt) == false {
 		panic("duplicated index")
 	}
 }
 
-func (spb *streamReadBuffer) Read(data []byte) (int, error) {
-	spb.rBegin()
-	defer spb.rDone()
+func (srb *streamReadBuffer) Read(data []byte) (int, error) {
+	srb.rBegin()
+	defer srb.rDone()
 
 	for {
-		if spb.buf != nil && spb.buf.Len() > 0 {
-			sz, err := spb.buf.Read(data)
+		if srb.buf != nil && srb.buf.Len() > 0 {
+			sz, err := srb.buf.Read(data)
 			if err != nil {
 				panic(err)
 			}
 			return sz, nil
-		} else if spb.err != nil {
-			return 0, spb.err
+		} else if srb.err != nil {
+			return 0, srb.err
 		}
-		spb.waitForWrite()
+		srb.waitForWrite()
 	}
 }
