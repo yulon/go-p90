@@ -76,6 +76,7 @@ func newConn(id uuid.UUID, locPr *Peer, rmtAddr net.Addr) *Conn {
 		locPr:            locPr,
 		rmtAddr:          rmtAddr,
 		nowRTT:           newAtomicDur(DefaultRTT),
+		nowRTSC:          1,
 		minRTT:           newAtomicDur(DefaultRTT),
 		handshakeTimeout: newAtomicDur(10 * time.Second),
 		wTimeout:         newAtomicDur(30 * time.Second),
@@ -308,7 +309,7 @@ func (con *Conn) send(typ byte, others ...interface{}) error {
 		return nil
 	}
 
-	spc := &sendPktCtx{id: h.PktCount, pkt: pkt, wFirstTime: con.wLastTime.Get()}
+	spc := &sendPktCtx{id: h.PktCount, pkt: pkt, wFirstTime: con.wLastTime.Get(), wCount: 1}
 
 	err = con.flush(false)
 	if err != nil {
@@ -369,11 +370,10 @@ func (con *Conn) handleWTimeout() (time.Duration, error) {
 	}
 
 	durMax := con.minRTT.Get()
-	durMax += durMax / 10
+	durMax += durMax / 8
 	dur := durMax
 
 	now := time.Now()
-
 	for _, spc := range con.cWnd {
 		if now.Sub(spc.wFirstTime) > wTimeout.Get() {
 			if !con.isHandshaked {
@@ -381,20 +381,20 @@ func (con *Conn) handleWTimeout() (time.Duration, error) {
 			}
 			return -1, errors.New("sending a packet timeout")
 		}
-		ela := now.Sub(spc.wLastTime)
-		if ela < durMax {
-			rem := durMax - ela
-			if rem < dur {
-				dur = rem
+		left := durMax - now.Sub(spc.wLastTime)
+		if left > 0 {
+			if left < dur {
+				dur = left
 			}
 			continue
+		} else if durMax < dur {
+			dur = durMax
 		}
 		err := con.resend(spc)
 		if err != nil {
 			return -1, err
 		}
 	}
-
 	return dur, nil
 }
 
