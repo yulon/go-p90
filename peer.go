@@ -67,7 +67,7 @@ func (pr *Peer) bypassRecv(from net.Addr, to net.PacketConn, h *Header, p []byte
 		if pr.acptCh == nil {
 			return
 		}
-		con = newConn(h.ConID, pr, from)
+		con = newConn(h.ConID, pr, from, false)
 		actual, loaded := pr.conMap.LoadOrStore(h.ConID, con)
 		if loaded {
 			con = actual.(*Conn)
@@ -108,7 +108,7 @@ func listen(pktCon net.PacketConn, isUnique bool) (*Peer, error) {
 
 			pr.conMap.Range(func(_, v interface{}) bool {
 				con := v.(*Conn)
-				d := con.handleRTimeout()
+				d := con.handleRTO()
 				if d > 0 && d < dur {
 					dur = d
 				}
@@ -146,7 +146,7 @@ func (pr *Peer) dial(addr net.Addr) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	con := newConn(id, pr, addr)
+	con := newConn(id, pr, addr, true)
 	pr.conMap.LoadOrStore(id, con)
 	return con, nil
 }

@@ -36,9 +36,8 @@ type Conn struct {
 	handshakeTimeout *atomicDur
 	isHandshaked     bool
 
-	wTimeout      *atomicDur
-	rTimeout      *atomicDur
-	isWaitingFine uintptr
+	wTimeout *atomicDur
+	rTimeout *atomicDur
 
 	nowRTT  *atomicDur
 	nowRTSC uintptr
@@ -46,6 +45,8 @@ type Conn struct {
 
 	wLastTime *atomicTime
 	rLastTime *atomicTime
+
+	isKeepAlived bool
 
 	wPktCount uint64
 
@@ -69,7 +70,7 @@ type Conn struct {
 	rStrmBuf   streamReadBuffer
 }
 
-func newConn(id uuid.UUID, locPr *Peer, rmtAddr net.Addr) *Conn {
+func newConn(id uuid.UUID, locPr *Peer, rmtAddr net.Addr, isKeepAlived bool) *Conn {
 	now := time.Now()
 	con := &Conn{
 		id:               id,
@@ -83,13 +84,14 @@ func newConn(id uuid.UUID, locPr *Peer, rmtAddr net.Addr) *Conn {
 		rTimeout:         newAtomicDur(90 * time.Second),
 		rLastTime:        newAtomicTime(now),
 		wLastTime:        newAtomicTime(now),
+		isKeepAlived:     isKeepAlived,
 		cWndSizeMax:      2048 * 1024,
 		sentPktSorter:    newSorter(nil, nil),
 		rPktSorter:       newSorter(nil, nil),
 	}
 	con.cWndOnPush = sync.NewCond(&con.mtx)
 	con.cWndOnPop = sync.NewCond(&con.mtx)
-	go con.loopHandleWTimeout()
+	go con.loopHandleWTO()
 	return con
 }
 
@@ -174,9 +176,6 @@ func (con *Conn) handleRecv(from net.Addr, h *Header, r *bytes.Buffer) error {
 	}
 
 	con.rLastTime.Set(time.Now())
-	if atomic.LoadUintptr(&con.isWaitingFine) != 0 {
-		atomic.StoreUintptr(&con.isWaitingFine, 0)
-	}
 
 	con.rmtAddr = from
 
@@ -237,23 +236,22 @@ func (con *Conn) Read(b []byte) (int, error) {
 	return n, con.opErr("Read", err)
 }
 
-func (con *Conn) handleRTimeout() time.Duration {
-	if atomic.LoadUintptr(&con.isWaitingFine) != 0 && atomic.SwapUintptr(&con.isWaitingFine, 1) != 0 {
-		return -1
-	}
+const dur3sec = 3 * time.Second
 
-	wto := con.wTimeout.Get()
-	rto := con.rTimeout.Get()
-	if wto > rto {
-		rto = 0
-	} else {
-		rto -= wto
-	}
-
+func (con *Conn) handleRTO() time.Duration {
 	now := time.Now()
+
+	/*if con.isKeepAlived {
+		to := con.wTimeout.Get() + dur3sec
+		ela := now.Sub(con.wLastTime.Get())
+		if ela < to {
+			return to - ela
+		}
+	}*/
+
+	rto := con.rTimeout.Get()
 	ela := now.Sub(con.rLastTime.Get())
 	if ela < rto {
-		atomic.StoreUintptr(&con.isWaitingFine, 0)
 		return rto - ela
 	}
 
@@ -262,7 +260,12 @@ func (con *Conn) handleRTimeout() time.Duration {
 	if con.state > csNormal {
 		return -1
 	}
-	con.send(ptHowAreYou)
+
+	/*if con.isKeepAlived {
+		con.send(ptHowAreYou)
+		return -1
+	}*/
+	con.close(errors.New("receiving timeout"))
 	return -1
 }
 
@@ -318,7 +321,7 @@ func (con *Conn) send(typ byte, others ...interface{}) error {
 
 	if con.sentPktSorter.Has(h.PktCount) {
 		if h.PktCount == con.someoneSentPktID {
-			con.updateRTInfo(con.someonePktSentTS.Sub(spc.wFirstTime), spc.wCount)
+			con.updateRTI(con.someonePktSentTS.Sub(spc.wFirstTime), spc.wCount)
 			con.someoneSentPktID = 0
 		}
 		return nil
@@ -359,7 +362,7 @@ func (con *Conn) resend(spc *sendPktCtx) error {
 	return err
 }
 
-func (con *Conn) handleWTimeout() (time.Duration, error) {
+func (con *Conn) handleWTO() (time.Duration, error) {
 	if con.cWndSize == 0 {
 		return -1, nil
 	}
@@ -398,14 +401,14 @@ func (con *Conn) handleWTimeout() (time.Duration, error) {
 	return dur, nil
 }
 
-func (con *Conn) loopHandleWTimeout() {
+func (con *Conn) loopHandleWTO() {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 	for {
 		if con.state == csClosed {
 			return
 		}
-		dur, err := con.handleWTimeout()
+		dur, err := con.handleWTO()
 		if err != nil {
 			con.close(err)
 			return
@@ -420,7 +423,7 @@ func (con *Conn) loopHandleWTimeout() {
 	}
 }
 
-func (con *Conn) updateRTInfo(rtt time.Duration, wCount uintptr) {
+func (con *Conn) updateRTI(rtt time.Duration, wCount uintptr) {
 	con.nowRTT.Set(rtt)
 	minRTT := con.minRTT.Get()
 	if rtt < minRTT {
@@ -440,7 +443,7 @@ func (con *Conn) cleanCWnd(pktIDs ...uint64) error {
 		isRm := false
 		for i, spc := range con.cWnd {
 			if spc.id == pktID {
-				con.updateRTInfo(now.Sub(spc.wFirstTime), spc.wCount)
+				con.updateRTI(now.Sub(spc.wFirstTime), spc.wCount)
 
 				con.cWndSize -= len(spc.pkt)
 
