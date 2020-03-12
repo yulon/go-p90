@@ -34,7 +34,7 @@ type Conn struct {
 	state byte
 
 	handshakeTimeout *atomicDur
-	isHandshaked     bool
+	isHandshaked     uintptr
 
 	wTimeout *atomicDur
 	rTimeout *atomicDur
@@ -46,7 +46,8 @@ type Conn struct {
 	wLastTime *atomicTime
 	rLastTime *atomicTime
 
-	isKeepAlived bool
+	isKeepAlived  bool
+	isWaitingFine uintptr
 
 	wPktCount uint64
 
@@ -176,11 +177,12 @@ func (con *Conn) handleRecv(from net.Addr, h *Header, r *bytes.Buffer) error {
 	}
 
 	con.rLastTime.Set(time.Now())
-
 	con.rmtAddr = from
-
-	if !con.isHandshaked {
-		con.isHandshaked = true
+	if atomic.LoadUintptr(&con.isWaitingFine) == 1 {
+		atomic.StoreUintptr(&con.isWaitingFine, 0)
+	}
+	if atomic.LoadUintptr(&con.isHandshaked) == 0 {
+		atomic.StoreUintptr(&con.isHandshaked, 1)
 	}
 
 	if isReliablePT[h.PktType] && h.PktCount > 0 {
@@ -241,31 +243,31 @@ const dur3sec = 3 * time.Second
 func (con *Conn) handleRTO() time.Duration {
 	now := time.Now()
 
-	/*if con.isKeepAlived {
-		to := con.wTimeout.Get() + dur3sec
-		ela := now.Sub(con.wLastTime.Get())
-		if ela < to {
-			return to - ela
-		}
-	}*/
-
 	rto := con.rTimeout.Get()
 	ela := now.Sub(con.rLastTime.Get())
-	if ela < rto {
-		return rto - ela
+	dur := rto - ela
+	if dur > 0 {
+		if con.isKeepAlived {
+			wto := con.wTimeout.Get()
+			if dur <= wto && atomic.LoadUintptr(&con.isHandshaked) == 1 && atomic.SwapUintptr(&con.isWaitingFine, 1) == 0 {
+				con.mtx.Lock()
+				defer con.mtx.Unlock()
+				if con.state == csNormal {
+					con.send(ptHowAreYou)
+				}
+				return dur
+			}
+			return dur - wto
+		}
+		return dur
 	}
 
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
-	if con.state > csNormal {
-		return -1
-	}
 
-	/*if con.isKeepAlived {
-		con.send(ptHowAreYou)
-		return -1
-	}*/
-	con.close(errors.New("receiving timeout"))
+	if con.state < csClosed {
+		con.close(errors.New("receiving timeout"))
+	}
 	return -1
 }
 
@@ -368,7 +370,7 @@ func (con *Conn) handleWTO() (time.Duration, error) {
 	}
 
 	wTimeout := con.wTimeout
-	if !con.isHandshaked && con.handshakeTimeout.Get() < con.wTimeout.Get() {
+	if atomic.LoadUintptr(&con.isHandshaked) == 0 && con.handshakeTimeout.Get() < con.wTimeout.Get() {
 		wTimeout = con.handshakeTimeout
 	}
 
@@ -379,7 +381,7 @@ func (con *Conn) handleWTO() (time.Duration, error) {
 	now := time.Now()
 	for _, spc := range con.cWnd {
 		if now.Sub(spc.wFirstTime) > wTimeout.Get() {
-			if !con.isHandshaked {
+			if atomic.LoadUintptr(&con.isHandshaked) == 0 {
 				return -1, errors.New("handshaking timeout")
 			}
 			return -1, errors.New("sending a packet timeout")
