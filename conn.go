@@ -641,3 +641,48 @@ func (con *Conn) SetDeadline(t time.Time) error {
 	con.rTimeout.Set(dur)
 	return nil
 }
+
+type unreliablePacketer struct {
+	*Conn
+}
+
+func (upktr *unreliablePacketer) Write(b []byte) (int, error) {
+	err := upktr.UnreliableSend(b)
+	if err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+var errDataSizeOverflow = errors.New("data size overflow")
+
+func (upktr *unreliablePacketer) Read(b []byte) (int, error) {
+	data, err := upktr.Recv()
+	if err != nil {
+		return 0, err
+	}
+	sz := len(data)
+	if len(b) < sz {
+		return 0, upktr.opErr("PacketRead", errDataSizeOverflow)
+	}
+	copy(b, data)
+	return sz, nil
+}
+
+func (con *Conn) UnreliablePacketer() net.Conn {
+	return &unreliablePacketer{con}
+}
+
+type packeter unreliablePacketer
+
+func (pktr *packeter) Write(b []byte) (int, error) {
+	err := pktr.Send(b)
+	if err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (con *Conn) Packeter() net.Conn {
+	return (*packeter)(&unreliablePacketer{con})
+}
