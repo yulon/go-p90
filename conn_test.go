@@ -16,23 +16,24 @@ func TestConn(*testing.T) {
 			panic(err)
 		}
 
-		data, err := con.Recv()
+		buf := make([]byte, 2048)
+		n, err := con.ReadPacket(buf)
 		if err != nil {
 			panic(err)
 		}
-		fmt.Println("server recv:", string(data))
+		fmt.Println("server read packet:", string(buf[:n]))
 
-		fmt.Println("server send: 246")
-		err = con.Send([]byte("246"))
+		fmt.Println("server write packet: 246")
+		_, err = con.WritePacket([]byte("246"))
 		if err != nil {
 			panic(err)
 		}
 
-		_, err = con.Read(data)
+		n, err = con.Read(buf)
 		if err != nil {
 			panic(err)
 		}
-		fmt.Println("server read:", string(data))
+		fmt.Println("server read:", string(buf[:n]))
 
 		fmt.Println("server write: 000")
 		_, err = con.Write([]byte("000"))
@@ -49,17 +50,18 @@ func TestConn(*testing.T) {
 		panic(err)
 	}
 
-	fmt.Println("client send: 123")
-	err = con.Send([]byte("123"))
+	fmt.Println("client write packet: 123")
+	_, err = con.WritePacket([]byte("123"))
 	if err != nil {
 		panic(err)
 	}
 
-	data, err := con.Recv()
+	buf := make([]byte, 2048)
+	n, err := con.ReadPacket(buf)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("client recv:", string(data))
+	fmt.Println("client read packet:", string(buf[:n]))
 
 	fmt.Println("client write: 111")
 	_, err = con.Write([]byte("111"))
@@ -67,11 +69,11 @@ func TestConn(*testing.T) {
 		panic(err)
 	}
 
-	_, err = con.Read(data)
+	n, err = con.Read(buf)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("client read:", string(data))
+	fmt.Println("client read:", string(buf[:n]))
 
 	fmt.Println("client close once:", con.Close())
 	fmt.Println("client close twice:", con.Close())

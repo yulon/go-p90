@@ -228,14 +228,27 @@ func (con *Conn) handleRecv(from net.Addr, h *Header, r *bytes.Buffer) error {
 	return nil
 }
 
-func (con *Conn) Recv() ([]byte, error) {
+var errDataSizeOverflow = errors.New("data size overflow")
+
+func (con *Conn) ReadPacket(b []byte) (int, error) {
 	pkt, err := con.rDataBuf.Get()
-	return pkt, con.opErr("Recv", err)
+	if err != nil {
+		return 0, con.opErr("ReadPacket", err)
+	}
+	n := len(pkt)
+	if len(b) < n {
+		return 0, con.opErr("ReadPacket", errDataSizeOverflow)
+	}
+	copy(b, pkt)
+	return n, nil
 }
 
 func (con *Conn) Read(b []byte) (int, error) {
 	n, err := con.rStrmBuf.Read(b)
-	return n, con.opErr("Read", err)
+	if err != nil {
+		return 0, con.opErr("Read", err)
+	}
+	return n, nil
 }
 
 const dur3sec = 3 * time.Second
@@ -475,26 +488,34 @@ func (con *Conn) cleanCWnd(pktIDs ...uint64) error {
 	return nil
 }
 
-func (con *Conn) UnreliableSend(data []byte) error {
+func (con *Conn) WriteUnreliablePacket(data []byte) (int, error) {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
 	err := con.checkCloseErr()
-	if err == nil {
-		err = con.send(ptUnreliableData, data)
+	if err != nil {
+		return 0, con.opErr("WritePacket", err)
 	}
-	return con.opErr("UnreliableSend", err)
+	err = con.send(ptUnreliableData, data)
+	if err != nil {
+		return 0, con.opErr("WritePacket", err)
+	}
+	return len(data), nil
 }
 
-func (con *Conn) Send(data []byte) error {
+func (con *Conn) WritePacket(data []byte) (int, error) {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
 	err := con.checkCloseErr()
-	if err == nil {
-		err = con.send(ptData, data)
+	if err != nil {
+		return 0, con.opErr("WritePacket", err)
 	}
-	return con.opErr("Send", err)
+	err = con.send(ptData, data)
+	if err != nil {
+		return 0, con.opErr("WritePacket", err)
+	}
+	return len(data), nil
 }
 
 func (con *Conn) Write(b []byte) (int, error) {
@@ -647,26 +668,11 @@ type unreliablePacketer struct {
 }
 
 func (upktr *unreliablePacketer) Write(b []byte) (int, error) {
-	err := upktr.UnreliableSend(b)
-	if err != nil {
-		return 0, err
-	}
-	return len(b), nil
+	return upktr.WriteUnreliablePacket(b)
 }
 
-var errDataSizeOverflow = errors.New("data size overflow")
-
 func (upktr *unreliablePacketer) Read(b []byte) (int, error) {
-	data, err := upktr.Recv()
-	if err != nil {
-		return 0, err
-	}
-	sz := len(data)
-	if len(b) < sz {
-		return 0, upktr.opErr("PacketRead", errDataSizeOverflow)
-	}
-	copy(b, data)
-	return sz, nil
+	return upktr.ReadPacket(b)
 }
 
 func (con *Conn) UnreliablePacketer() net.Conn {
@@ -676,11 +682,7 @@ func (con *Conn) UnreliablePacketer() net.Conn {
 type packeter unreliablePacketer
 
 func (pktr *packeter) Write(b []byte) (int, error) {
-	err := pktr.Send(b)
-	if err != nil {
-		return 0, err
-	}
-	return len(b), nil
+	return pktr.WritePacket(b)
 }
 
 func (con *Conn) Packeter() net.Conn {
