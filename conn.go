@@ -679,12 +679,18 @@ func (con *Conn) UnreliablePacketer() net.Conn {
 	return &unreliablePacketer{con}
 }
 
-type packeter unreliablePacketer
+type packeter struct {
+	*Conn
+}
 
 func (pktr *packeter) Write(b []byte) (int, error) {
 	return pktr.WritePacket(b)
 }
 
+func (pktr *packeter) Read(b []byte) (int, error) {
+	return pktr.ReadPacket(b)
+}
+
 func (con *Conn) Packeter() net.Conn {
-	return (*packeter)(&unreliablePacketer{con})
+	return &packeter{con}
 }
