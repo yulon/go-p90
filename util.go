@@ -53,30 +53,6 @@ func NewLocalUDPAddr(port int, remoteUDPAddr *net.UDPAddr) *net.UDPAddr {
 	return localUDPAddr
 }
 
-func ResolveAddr(network, addrStr string) (net.Addr, error) {
-	if len(network) < 2 {
-		return nil, net.UnknownNetworkError(network)
-	}
-	if network[2:] == "ip" {
-		return net.ResolveIPAddr(network, addrStr)
-	}
-
-	if len(network) < 3 {
-		return nil, net.UnknownNetworkError(network)
-	}
-	switch network[3:] {
-	case "udp":
-		return net.ResolveUDPAddr(network, addrStr)
-	case "tcp":
-		return net.ResolveTCPAddr(network, addrStr)
-	}
-
-	if len(network) < 4 {
-		return nil, net.UnknownNetworkError(network)
-	}
-	return net.ResolveUnixAddr(network, addrStr)
-}
-
 type atomicTime struct {
 	val int64
 }

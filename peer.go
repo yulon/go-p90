@@ -49,7 +49,8 @@ func (pr *Peer) tryRespCloseTo(addr net.Addr, h *Header) bool {
 }
 
 func (pr *Peer) bypassRecv(from net.Addr, to net.PacketConn, h *Header, p []byte) {
-	r := bytes.NewBuffer(p)
+	r := bytes.NewBuffer(nil)
+	r.Write(p)
 	err := binary.Read(r, binary.LittleEndian, h)
 
 	if err != nil || !HeaderIsValid(h) || int(h.PktType) >= len(isReliablePT) {
@@ -168,7 +169,7 @@ func (pr *Peer) Dial(addrStr string) (*Conn, error) {
 	if pr.wasClosed {
 		return nil, pr.opErr("Dial", errPeerWasClosed)
 	}
-	addr, err := ResolveAddr(pr.locLnr.LocalAddr().Network(), addrStr)
+	addr, err := net.ResolveUDPAddr(pr.locLnr.LocalAddr().Network(), addrStr)
 	if err != nil {
 		return nil, err
 	}
