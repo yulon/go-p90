@@ -36,12 +36,12 @@ type Conn struct {
 	handshakeTimeout *atomicDur
 	isHandshaked     uintptr
 
-	wTimeout *atomicDur
-	rTimeout *atomicDur
+	wTimeout    *atomicDur
+	idleTimeout *atomicDur
 
-	nowRTT  *atomicDur
-	nowRTSC uintptr
-	minRTT  *atomicDur
+	rtt    *atomicDur
+	rtsc   uintptr
+	minRTT *atomicDur
 
 	wLastTime *atomicTime
 	rLastTime *atomicTime
@@ -49,20 +49,19 @@ type Conn struct {
 	isKeepAlived  bool
 	isWaitingFine uintptr
 
-	wPktCount uint64
+	lastPktID       uint64
+	sayingHowAreYou bool
 
-	cWnd        []*sendPktCtx
-	cWndSize    int
-	cWndSizeMax int
+	cWnd        []*sendingPkt
+	cWndSize    int64
+	cWndSizeMax int64
 	cWndOnPush  *sync.Cond
 	cWndOnPop   *sync.Cond
 	cWndErr     error
 
-	sentPktSorter    *sorter
-	someoneSentPktID uint64
-	someonePktSentTS time.Time
+	sentPkts *sorter
 
-	rPktSorter *sorter
+	replyPkts *sorter
 
 	rDataBuf dataReadBuffer
 
@@ -77,18 +76,18 @@ func newConn(id uuid.UUID, locPr *Peer, rmtAddr net.Addr, isKeepAlived bool) *Co
 		id:               id,
 		locPr:            locPr,
 		rmtAddr:          rmtAddr,
-		nowRTT:           newAtomicDur(DefaultRTT),
-		nowRTSC:          1,
+		rtt:              newAtomicDur(DefaultRTT),
+		rtsc:             1,
 		minRTT:           newAtomicDur(DefaultRTT),
-		handshakeTimeout: newAtomicDur(10 * time.Second),
-		wTimeout:         newAtomicDur(30 * time.Second),
-		rTimeout:         newAtomicDur(90 * time.Second),
+		handshakeTimeout: newAtomicDur(100 * time.Second),
+		wTimeout:         newAtomicDur(10 * time.Second),
+		idleTimeout:      newAtomicDur(90 * time.Second),
+		isKeepAlived:     isKeepAlived,
 		rLastTime:        newAtomicTime(now),
 		wLastTime:        newAtomicTime(now),
-		isKeepAlived:     isKeepAlived,
 		cWndSizeMax:      2048 * 1024,
-		sentPktSorter:    newSorter(nil, nil),
-		rPktSorter:       newSorter(nil, nil),
+		sentPkts:         newSorter(nil, nil),
+		replyPkts:        newSorter(nil, nil),
 	}
 	con.cWndOnPush = sync.NewCond(&con.mtx)
 	con.cWndOnPop = sync.NewCond(&con.mtx)
@@ -168,7 +167,7 @@ func (con *Conn) Close() error {
 	return con.close(errClosedByLocal)
 }
 
-func (con *Conn) handleRecv(from net.Addr, h *Header, r *bytes.Buffer) error {
+func (con *Conn) handleRecv(from net.Addr, h *packetHeader, r *bytes.Buffer) error {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
@@ -185,17 +184,21 @@ func (con *Conn) handleRecv(from net.Addr, h *Header, r *bytes.Buffer) error {
 		atomic.StoreUintptr(&con.isHandshaked, 1)
 	}
 
-	if isReliablePT[h.PktType] && h.PktCount > 0 {
-		err := con.send(ptReceiveds, h.PktCount)
+	if isReliablePT[h.Type] && h.ID > 0 {
+		var rpi receivedPacketInfo
+		rpi.ID = h.ID
+		rpi.SendTime = h.SendTime
+		rpi.SendCount = h.SendCount
+		err := con.send(ptReceiveds, &rpi)
 		if err != nil {
 			return err
 		}
-		if !con.rPktSorter.TryAdd(h.PktCount, nil) {
+		if !con.replyPkts.TryAdd(h.ID, nil) {
 			return nil
 		}
 	}
 
-	switch h.PktType {
+	switch h.Type {
 
 	case ptData:
 		fallthrough
@@ -203,9 +206,9 @@ func (con *Conn) handleRecv(from net.Addr, h *Header, r *bytes.Buffer) error {
 		con.rDataBuf.Put(r.Bytes())
 
 	case ptReceiveds:
-		pktIDs := make([]uint64, r.Len()/8)
-		binary.Read(r, binary.LittleEndian, &pktIDs)
-		err := con.cleanCWnd(pktIDs...)
+		rpis := make([]receivedPacketInfo, r.Len()/17)
+		binary.Read(r, binary.LittleEndian, &rpis)
+		err := con.cleanCWnd(rpis...)
 		if err != nil {
 			con.close(err)
 			return err
@@ -256,23 +259,33 @@ const dur3sec = 3 * time.Second
 func (con *Conn) handleRTO() time.Duration {
 	now := time.Now()
 
-	rto := con.rTimeout.Get()
-	ela := now.Sub(con.rLastTime.Get())
-	dur := rto - ela
-	if dur > 0 {
-		if con.isKeepAlived {
-			wto := con.wTimeout.Get()
-			if dur <= wto && atomic.LoadUintptr(&con.isHandshaked) == 1 && atomic.SwapUintptr(&con.isWaitingFine, 1) == 0 {
-				con.mtx.Lock()
-				defer con.mtx.Unlock()
-				if con.state == csNormal {
-					con.send(ptHowAreYou)
-				}
-				return dur
+	if con.isKeepAlived { // TODO: move to handleWTO
+		wto := con.wTimeout.Get()
+		if atomic.LoadUintptr(&con.isHandshaked) == 1 && atomic.SwapUintptr(&con.isWaitingFine, 1) == 0 {
+			con.mtx.Lock()
+			defer con.mtx.Unlock()
+			if con.state == csNormal {
+				con.send(ptHowAreYou)
 			}
-			return dur - wto
 		}
-		return dur
+		return wto + wto/2
+	}
+
+	ito := con.idleTimeout.Get()
+	if ito == 0 {
+		return -1
+	}
+	rEla := now.Sub(con.rLastTime.Get())
+	wEla := now.Sub(con.wLastTime.Get())
+	rRem := ito - rEla
+	wRem := ito - wEla
+	if rRem > 0 {
+		if wRem > 0 {
+			if wRem < rRem {
+				return wRem
+			}
+			return rRem
+		}
 	}
 
 	con.mtx.Lock()
@@ -284,18 +297,25 @@ func (con *Conn) handleRTO() time.Duration {
 	return -1
 }
 
-func (con *Conn) write(pkt []byte) error {
-	con.wLastTime.Set(time.Now())
-	_, err := con.locPr.writeTo(pkt, con.rmtAddr)
-	return err
+func (con *Conn) writePkt(h *packetHeader, now time.Time, body []byte) (int, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	con.wLastTime.Set(now)
+
+	h.SendTime = now.UnixMilli()
+	h.SendCount++
+
+	return con.locPr.writeTo(makePacket(h, body), con.rmtAddr)
 }
 
-type sendPktCtx struct {
-	id         uint64
-	pkt        []byte
+type sendingPkt struct {
+	h          *packetHeader
+	body       []byte
+	sz         int
 	wFirstTime time.Time
 	wLastTime  time.Time
-	wCount     uintptr
 }
 
 func (con *Conn) send(typ byte, others ...interface{}) error {
@@ -306,19 +326,30 @@ func (con *Conn) send(typ byte, others ...interface{}) error {
 	isReliable := isReliablePT[typ]
 
 	if isReliable {
-		con.wPktCount++
+		if typ == ptHowAreYou {
+			if con.sayingHowAreYou {
+				return nil
+			}
+			con.sayingHowAreYou = true
+		} else {
+			con.sayingHowAreYou = false
+		}
+		con.lastPktID++
 	}
 
-	h := Header{
-		Checksum: MagicNumber,
-		ConID:    con.id,
-		PktCount: con.wPktCount,
-		PktType:  typ,
+	now := time.Now()
+
+	h := &packetHeader{
+		Checksum:  MagicNumber,
+		ConID:     con.id,
+		ID:        con.lastPktID,
+		Type:      typ,
+		SendCount: 0,
 	}
 
-	pkt := makePacket(&h, others...)
+	body := makePacketBody(others...)
 
-	err := con.write(pkt)
+	sz, err := con.writePkt(h, now, body)
 	if err != nil {
 		return err
 	}
@@ -327,23 +358,20 @@ func (con *Conn) send(typ byte, others ...interface{}) error {
 		return nil
 	}
 
-	spc := &sendPktCtx{id: h.PktCount, pkt: pkt, wFirstTime: con.wLastTime.Get(), wCount: 1}
+	sp := &sendingPkt{h: h, body: body, sz: sz, wFirstTime: now, wLastTime: now}
 
 	err = con.flush(false)
 	if err != nil {
 		return err
 	}
 
-	if con.sentPktSorter.Has(h.PktCount) {
-		if h.PktCount == con.someoneSentPktID {
-			con.updateRTI(con.someonePktSentTS.Sub(spc.wFirstTime), spc.wCount)
-			con.someoneSentPktID = 0
-		}
+	con.cWndSize += int64(sz)
+
+	if con.sentPkts.Has(h.ID) {
 		return nil
 	}
 
-	con.cWnd = append(con.cWnd, spc)
-	con.cWndSize += len(spc.pkt)
+	con.cWnd = append(con.cWnd, sp)
 	con.cWndOnPush.Signal()
 	return nil
 }
@@ -370,10 +398,12 @@ func (con *Conn) flush(isWantFlushAll bool) error {
 	}
 }
 
-func (con *Conn) resend(spc *sendPktCtx) error {
-	spc.wCount++
-	err := con.write(spc.pkt)
-	spc.wLastTime = con.wLastTime.Get()
+func (con *Conn) resend(sp *sendingPkt) error {
+	now := time.Now()
+	_, err := con.writePkt(sp.h, now, sp.body)
+	if err == nil {
+		sp.wLastTime = now
+	}
 	return err
 }
 
@@ -387,28 +417,26 @@ func (con *Conn) handleWTO() (time.Duration, error) {
 		wTimeout = con.handshakeTimeout
 	}
 
-	durMax := con.minRTT.Get()
+	durMax := con.rtt.Get()
 	durMax += durMax / 8
 	dur := durMax
 
 	now := time.Now()
-	for _, spc := range con.cWnd {
-		if now.Sub(spc.wFirstTime) > wTimeout.Get() {
+	for _, sp := range con.cWnd {
+		if now.Sub(sp.wFirstTime) > wTimeout.Get() {
 			if atomic.LoadUintptr(&con.isHandshaked) == 0 {
 				return -1, errors.New("handshaking timeout")
 			}
 			return -1, errors.New("sending a packet timeout")
 		}
-		left := durMax - now.Sub(spc.wLastTime)
-		if left > 0 {
-			if left < dur {
-				dur = left
+		durRem := durMax - now.Sub(sp.wLastTime)
+		if durRem > 0 {
+			if durRem < dur {
+				dur = durRem
 			}
 			continue
-		} else if durMax < dur {
-			dur = durMax
 		}
-		err := con.resend(spc)
+		err := con.resend(sp)
 		if err != nil {
 			return -1, err
 		}
@@ -438,29 +466,27 @@ func (con *Conn) loopHandleWTO() {
 	}
 }
 
-func (con *Conn) updateRTI(rtt time.Duration, wCount uintptr) {
-	con.nowRTT.Set(rtt)
-	minRTT := con.minRTT.Get()
-	if rtt < minRTT {
+func (con *Conn) updateRTInfo(rtt time.Duration, wCount uintptr) {
+	con.rtt.Set(rtt)
+	if rtt < con.minRTT.Get() {
 		con.minRTT.Set(rtt)
 	}
-	atomic.SwapUintptr(&con.nowRTSC, wCount)
+	atomic.SwapUintptr(&con.rtsc, wCount)
 }
 
-func (con *Conn) cleanCWnd(pktIDs ...uint64) error {
+func (con *Conn) cleanCWnd(rpis ...receivedPacketInfo) error {
 	now := time.Now()
 	isSent := false
-	for _, pktID := range pktIDs {
-		if !con.sentPktSorter.TryAdd(pktID, nil) {
+	for _, rpi := range rpis {
+		if !con.sentPkts.TryAdd(rpi.ID, nil) {
 			continue
 		}
 		isSent = true
-		isRm := false
-		for i, spc := range con.cWnd {
-			if spc.id == pktID {
-				con.updateRTI(now.Sub(spc.wFirstTime), spc.wCount)
+		for i, sp := range con.cWnd {
+			if sp.h.ID == rpi.ID {
+				con.updateRTInfo(time.Duration(now.UnixMilli()-rpi.SendTime)*time.Millisecond, uintptr(rpi.SendCount))
 
-				con.cWndSize -= len(spc.pkt)
+				con.cWndSize -= int64(sp.sz)
 
 				if i == 0 {
 					con.cWnd = con.cWnd[1:]
@@ -470,16 +496,12 @@ func (con *Conn) cleanCWnd(pktIDs ...uint64) error {
 					con.cWnd = con.cWnd[:i]
 					break
 				}
-				cWndRights := make([]*sendPktCtx, len(con.cWnd[i+1:]))
+				cWndRights := make([]*sendingPkt, len(con.cWnd[i+1:]))
 				copy(cWndRights, con.cWnd[i+1:])
 				con.cWnd = con.cWnd[:len(con.cWnd)-1]
 				copy(con.cWnd[i:], cWndRights)
 				break
 			}
-		}
-		if !isRm && con.someoneSentPktID == 0 {
-			con.someoneSentPktID = pktID
-			con.someonePktSentTS = now
 		}
 	}
 	if isSent {
@@ -572,11 +594,11 @@ func (con *Conn) ID() uuid.UUID {
 }
 
 func (con *Conn) RTT() time.Duration {
-	return con.nowRTT.Get()
+	return con.rtt.Get()
 }
 
 func (con *Conn) PacketLoss() float32 {
-	return float32(1) - float32(1)/float32(atomic.LoadUintptr(&con.nowRTSC))
+	return float32(1) - float32(1)/float32(atomic.LoadUintptr(&con.rtsc))
 }
 
 func (con *Conn) LastReadTime() time.Time {
@@ -596,6 +618,19 @@ func (con *Conn) LastActivityTime() time.Time {
 	return st
 }
 
+func (con *Conn) SetReadTimeout(dur time.Duration) error {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	err := con.checkCloseErr()
+	if err != nil {
+		return con.opErr("SetReadTimeout", err)
+	}
+
+	// con.rTimeout.Set(dur)
+	return nil
+}
+
 func (con *Conn) SetWriteTimeout(dur time.Duration) error {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
@@ -609,29 +644,16 @@ func (con *Conn) SetWriteTimeout(dur time.Duration) error {
 	return nil
 }
 
-func (con *Conn) SetReadTimeout(dur time.Duration) error {
+func (con *Conn) SetIdleTimeout(dur time.Duration) error {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
 	err := con.checkCloseErr()
 	if err != nil {
-		return con.opErr("SetReadTimeout", err)
+		return con.opErr("SetIdleTimeout", err)
 	}
 
-	con.rTimeout.Set(dur)
-	return nil
-}
-
-func (con *Conn) SetWriteDeadline(t time.Time) error {
-	con.mtx.Lock()
-	defer con.mtx.Unlock()
-
-	err := con.checkCloseErr()
-	if err != nil {
-		return con.opErr("SetWriteDeadline", err)
-	}
-
-	con.wTimeout.Set(t.Sub(time.Now()))
+	con.idleTimeout.Set(dur)
 	return nil
 }
 
@@ -644,7 +666,28 @@ func (con *Conn) SetReadDeadline(t time.Time) error {
 		return con.opErr("SetReadDeadline", err)
 	}
 
-	con.rTimeout.Set(t.Sub(time.Now()))
+	if t.IsZero() {
+		//con.rTimeout.Set(0)
+		return nil
+	}
+	//con.rTimeout.Set(t.Sub(time.Now()))
+	return nil
+}
+
+func (con *Conn) SetWriteDeadline(t time.Time) error {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	err := con.checkCloseErr()
+	if err != nil {
+		return con.opErr("SetWriteDeadline", err)
+	}
+
+	if t.IsZero() {
+		con.wTimeout.Set(0)
+		return nil
+	}
+	con.wTimeout.Set(t.Sub(time.Now()))
 	return nil
 }
 
@@ -657,9 +700,14 @@ func (con *Conn) SetDeadline(t time.Time) error {
 		return con.opErr("SetDeadline", err)
 	}
 
+	if t.IsZero() {
+		con.wTimeout.Set(0)
+		//con.rTimeout.Set(0)
+		return nil
+	}
 	dur := t.Sub(time.Now())
 	con.wTimeout.Set(dur)
-	con.rTimeout.Set(dur)
+	//con.rTimeout.Set(dur)
 	return nil
 }
 

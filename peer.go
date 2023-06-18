@@ -38,22 +38,22 @@ func (pr *Peer) writeTo(b []byte, addr net.Addr) (int, error) {
 	return pr.locLnr.WriteTo(b, addr)
 }
 
-func (pr *Peer) tryRespCloseTo(addr net.Addr, h *Header) bool {
-	if h.PktType != ptClose {
+func (pr *Peer) tryRespCloseTo(addr net.Addr, h *packetHeader) bool {
+	if h.Type != ptClose {
 		return false
 	}
-	h.PktType = ptReceiveds
-	h.PktCount = 0
+	h.Type = ptReceiveds
+	h.ID = 0
 	pr.writeTo(makePacket(h), addr)
 	return true
 }
 
-func (pr *Peer) bypassRecv(from net.Addr, to net.PacketConn, h *Header, p []byte) {
+func (pr *Peer) bypassRecv(from net.Addr, to net.PacketConn, h *packetHeader, p []byte) {
 	r := bytes.NewBuffer(nil)
 	r.Write(p)
 	err := binary.Read(r, binary.LittleEndian, h)
 
-	if err != nil || !HeaderIsValid(h) || int(h.PktType) >= len(isReliablePT) {
+	if err != nil || !PacketHeaderIsValid(h) || int(h.Type) >= len(isReliablePT) {
 		return
 	}
 
@@ -93,7 +93,7 @@ func listen(pktCon net.PacketConn, isUnique bool) (*Peer, error) {
 		pr.acptCh = make(chan *Conn, 1)
 	}
 	go func() {
-		var h Header
+		var h packetHeader
 		b := make([]byte, 4096)
 		for {
 			sz, addr, err := pr.locLnr.ReadFrom(b)

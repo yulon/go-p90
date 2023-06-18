@@ -8,12 +8,11 @@ import (
 	"time"
 )
 
-func writeData(buf *bytes.Buffer, others ...interface{}) {
+func writePacketBody(buf *bytes.Buffer, others ...interface{}) {
 	for _, other := range others {
 		switch other.(type) {
 		case nil:
 		case []byte:
-			//binary.Write(buf, binary.LittleEndian, uint16(len(other.([]byte))))
 			buf.Write(other.([]byte))
 		default:
 			binary.Write(buf, binary.LittleEndian, other)
@@ -21,19 +20,19 @@ func writeData(buf *bytes.Buffer, others ...interface{}) {
 	}
 }
 
-func makeData(others ...interface{}) []byte {
+func makePacketBody(others ...interface{}) []byte {
 	buf := bytes.NewBuffer(nil)
-	writeData(buf, others...)
+	writePacketBody(buf, others...)
 	return buf.Bytes()
 }
 
-func writePacket(buf *bytes.Buffer, h *Header, others ...interface{}) {
-	h.Checksum = GenHeaderChecksum(h)
+func writePacket(buf *bytes.Buffer, h *packetHeader, others ...interface{}) {
+	h.Checksum = CalcPacketHeaderChecksum(h)
 	binary.Write(buf, binary.LittleEndian, h)
-	writeData(buf, others...)
+	writePacketBody(buf, others...)
 }
 
-func makePacket(h *Header, others ...interface{}) []byte {
+func makePacket(h *packetHeader, others ...interface{}) []byte {
 	buf := bytes.NewBuffer(nil)
 	writePacket(buf, h, others...)
 	return buf.Bytes()
