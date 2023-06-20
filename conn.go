@@ -39,9 +39,12 @@ type Conn struct {
 	wTimeout    *atomicDur
 	idleTimeout *atomicDur
 
-	rtt    *atomicDur
-	rtsc   uintptr
-	minRTT *atomicDur
+	rtt               *atomicDur
+	rtsc              uintptr
+	minRTT            *atomicDur
+	resendTimeoutBase time.Duration
+	rttIncCnt         byte
+	minIncRTT         time.Duration
 
 	wLastTime *atomicTime
 	rLastTime *atomicTime
@@ -49,8 +52,7 @@ type Conn struct {
 	isKeepAlived  bool
 	isWaitingFine uintptr
 
-	lastPktID       uint64
-	sayingHowAreYou bool
+	lastPktID uint64
 
 	cWnd        []*sendingPkt
 	cWndSize    int64
@@ -59,8 +61,7 @@ type Conn struct {
 	cWndOnPop   *sync.Cond
 	cWndErr     error
 
-	sentPkts *sorter
-
+	sentPkts  *sorter
 	replyPkts *sorter
 
 	rDataBuf dataReadBuffer
@@ -73,21 +74,22 @@ type Conn struct {
 func newConn(id uuid.UUID, locPr *Peer, rmtAddr net.Addr, isKeepAlived bool) *Conn {
 	now := time.Now()
 	con := &Conn{
-		id:               id,
-		locPr:            locPr,
-		rmtAddr:          rmtAddr,
-		rtt:              newAtomicDur(DefaultRTT),
-		rtsc:             1,
-		minRTT:           newAtomicDur(DefaultRTT),
-		handshakeTimeout: newAtomicDur(100 * time.Second),
-		wTimeout:         newAtomicDur(10 * time.Second),
-		idleTimeout:      newAtomicDur(90 * time.Second),
-		isKeepAlived:     isKeepAlived,
-		rLastTime:        newAtomicTime(now),
-		wLastTime:        newAtomicTime(now),
-		cWndSizeMax:      2048 * 1024,
-		sentPkts:         newSorter(nil, nil),
-		replyPkts:        newSorter(nil, nil),
+		id:                id,
+		locPr:             locPr,
+		rmtAddr:           rmtAddr,
+		rtt:               newAtomicDur(DefaultRTT),
+		rtsc:              1,
+		minRTT:            newAtomicDur(DefaultRTT),
+		resendTimeoutBase: DefaultRTT,
+		handshakeTimeout:  newAtomicDur(100 * time.Second),
+		wTimeout:          newAtomicDur(10 * time.Second),
+		idleTimeout:       newAtomicDur(90 * time.Second),
+		isKeepAlived:      isKeepAlived,
+		rLastTime:         newAtomicTime(now),
+		wLastTime:         newAtomicTime(now),
+		cWndSizeMax:       2048 * 1024,
+		sentPkts:          newSorter(nil, nil),
+		replyPkts:         newSorter(nil, nil),
 	}
 	con.cWndOnPush = sync.NewCond(&con.mtx)
 	con.cWndOnPop = sync.NewCond(&con.mtx)
@@ -256,6 +258,8 @@ func (con *Conn) Read(b []byte) (int, error) {
 
 const dur3sec = 3 * time.Second
 
+var errRecvTimeout = errors.New("receiving timeout")
+
 func (con *Conn) handleRTO() time.Duration {
 	now := time.Now()
 
@@ -292,12 +296,18 @@ func (con *Conn) handleRTO() time.Duration {
 	defer con.mtx.Unlock()
 
 	if con.state < csClosed {
-		con.close(errors.New("receiving timeout"))
+		con.close(errRecvTimeout)
 	}
 	return -1
 }
 
+var errResendMaximum = errors.New("resend count has been maximum")
+
 func (con *Conn) writePkt(h *packetHeader, now time.Time, body []byte) (int, error) {
+	if h.SendCount == 255 {
+		return 0, errResendMaximum
+	}
+
 	if now.IsZero() {
 		now = time.Now()
 	}
@@ -326,14 +336,6 @@ func (con *Conn) send(typ byte, others ...interface{}) error {
 	isReliable := isReliablePT[typ]
 
 	if isReliable {
-		if typ == ptHowAreYou {
-			if con.sayingHowAreYou {
-				return nil
-			}
-			con.sayingHowAreYou = true
-		} else {
-			con.sayingHowAreYou = false
-		}
 		con.lastPktID++
 	}
 
@@ -407,6 +409,9 @@ func (con *Conn) resend(sp *sendingPkt) error {
 	return err
 }
 
+var errHandshakingTimeout = errors.New("handshaking timeout")
+var errSendingTimeout = errors.New("sending a packet timeout")
+
 func (con *Conn) handleWTO() (time.Duration, error) {
 	if con.cWndSize == 0 {
 		return -1, nil
@@ -417,22 +422,21 @@ func (con *Conn) handleWTO() (time.Duration, error) {
 		wTimeout = con.handshakeTimeout
 	}
 
-	durMax := con.rtt.Get()
-	durMax += durMax / 8
-	dur := durMax
+	resendTimeout := con.resendTimeoutBase + con.resendTimeoutBase/8
+	dur := resendTimeout
 
 	now := time.Now()
 	for _, sp := range con.cWnd {
 		if now.Sub(sp.wFirstTime) > wTimeout.Get() {
 			if atomic.LoadUintptr(&con.isHandshaked) == 0 {
-				return -1, errors.New("handshaking timeout")
+				return -1, errHandshakingTimeout
 			}
-			return -1, errors.New("sending a packet timeout")
+			return -1, errSendingTimeout
 		}
-		durRem := durMax - now.Sub(sp.wLastTime)
-		if durRem > 0 {
-			if durRem < dur {
-				dur = durRem
+		rem := resendTimeout - now.Sub(sp.wLastTime)
+		if rem > 0 {
+			if rem < dur {
+				dur = rem
 			}
 			continue
 		}
@@ -468,10 +472,32 @@ func (con *Conn) loopHandleWTO() {
 
 func (con *Conn) updateRTInfo(rtt time.Duration, wCount uintptr) {
 	con.rtt.Set(rtt)
+
 	if rtt < con.minRTT.Get() {
 		con.minRTT.Set(rtt)
 	}
+
 	atomic.SwapUintptr(&con.rtsc, wCount)
+
+	if con.resendTimeoutBase >= rtt {
+		con.resendTimeoutBase = rtt
+		if con.rttIncCnt > 0 {
+			con.rttIncCnt = 0
+			con.minIncRTT = 0
+		}
+		return
+	}
+
+	if con.minIncRTT == 0 || rtt < con.minIncRTT {
+		con.minIncRTT = rtt
+	}
+	con.rttIncCnt++
+	if con.rttIncCnt < 10 {
+		return
+	}
+	con.rttIncCnt = 0
+	con.resendTimeoutBase = con.minIncRTT
+	con.minIncRTT = 0
 }
 
 func (con *Conn) cleanCWnd(rpis ...receivedPacketInfo) error {
