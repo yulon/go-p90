@@ -42,6 +42,7 @@ type receivedPacketInfo struct {
 	ID        uint64
 	SendTime  int64
 	SendCount byte
+	RecvTime  int64
 }
 
 var CalcPacketHeaderHash = func(h *packetHeader) byte {

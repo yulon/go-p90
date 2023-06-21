@@ -99,7 +99,7 @@ func (srb *streamReadBuffer) Put(ix uint64, pkt []byte) {
 
 	if srb.buf == nil {
 		srb.buf = bytes.NewBuffer(nil)
-		srb.sor = newSorter(nil, func(datas []indexedData) {
+		srb.sor = newSorter(func(datas []indexedData) {
 			for _, data := range datas {
 				srb.buf.Write(data.val.([]byte))
 			}

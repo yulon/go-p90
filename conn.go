@@ -61,8 +61,8 @@ type Conn struct {
 	cWndOnPop   *sync.Cond
 	cWndErr     error
 
-	sentPkts  *sorter
-	replyPkts *sorter
+	sentPkts *sorter
+	repPkts  *sorter
 
 	rDataBuf dataReadBuffer
 
@@ -88,8 +88,8 @@ func newConn(id uuid.UUID, locPr *Peer, rmtAddr net.Addr, isKeepAlived bool) *Co
 		rLastTime:         newAtomicTime(now),
 		wLastTime:         newAtomicTime(now),
 		cWndSizeMax:       2048 * 1024,
-		sentPkts:          newSorter(nil, nil),
-		replyPkts:         newSorter(nil, nil),
+		sentPkts:          newSorter(nil),
+		repPkts:           newSorter(nil),
 	}
 	con.cWndOnPush = sync.NewCond(&con.mtx)
 	con.cWndOnPop = sync.NewCond(&con.mtx)
@@ -170,6 +170,8 @@ func (con *Conn) Close() error {
 }
 
 func (con *Conn) handleRecv(from net.Addr, h *packetHeader, r *bytes.Buffer) error {
+	now := time.Now().UnixMilli()
+
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
@@ -187,15 +189,42 @@ func (con *Conn) handleRecv(from net.Addr, h *packetHeader, r *bytes.Buffer) err
 	}
 
 	if isReliablePT[h.Type] && h.ID > 0 {
-		var rpi receivedPacketInfo
-		rpi.ID = h.ID
-		rpi.SendTime = h.SendTime
-		rpi.SendCount = h.SendCount
-		err := con.send(ptReceiveds, &rpi)
-		if err != nil {
-			return err
+		rpi := &receivedPacketInfo{
+			h.ID,
+			h.SendTime,
+			h.SendCount,
+			now,
 		}
-		if !con.replyPkts.TryAdd(h.ID, nil) {
+
+		nc := con.repPkts.NonContinuous()
+		n := len(nc)
+		if n == 0 {
+			err := con.send(ptReceiveds, rpi)
+			if err != nil {
+				return err
+			}
+		} else {
+			if n > 32 {
+				n = 32
+			}
+			n++
+
+			rpis := make([]interface{}, 1, n)
+			rpis[0] = rpi
+			for _, data := range nc {
+				rpis = append(rpis, data.val.(*receivedPacketInfo))
+				if len(rpis) >= n {
+					break
+				}
+			}
+
+			err := con.send(ptReceiveds, rpis...)
+			if err != nil {
+				return err
+			}
+		}
+
+		if !con.repPkts.TryAdd(h.ID, rpi) {
 			return nil
 		}
 	}
@@ -208,9 +237,9 @@ func (con *Conn) handleRecv(from net.Addr, h *packetHeader, r *bytes.Buffer) err
 		con.rDataBuf.Put(r.Bytes())
 
 	case ptReceiveds:
-		rpis := make([]receivedPacketInfo, r.Len()/17)
+		rpis := make([]receivedPacketInfo, r.Len()/25)
 		binary.Read(r, binary.LittleEndian, &rpis)
-		err := con.cleanCWnd(rpis...)
+		err := con.cleanCWnd(now, h.SendTime, rpis...)
 		if err != nil {
 			con.close(err)
 			return err
@@ -500,8 +529,7 @@ func (con *Conn) updateRTInfo(rtt time.Duration, wCount uintptr) {
 	con.minIncRTT = 0
 }
 
-func (con *Conn) cleanCWnd(rpis ...receivedPacketInfo) error {
-	now := time.Now()
+func (con *Conn) cleanCWnd(now, repTime int64, rpis ...receivedPacketInfo) error {
 	isSent := false
 	for _, rpi := range rpis {
 		if !con.sentPkts.TryAdd(rpi.ID, nil) {
@@ -510,7 +538,7 @@ func (con *Conn) cleanCWnd(rpis ...receivedPacketInfo) error {
 		isSent = true
 		for i, sp := range con.cWnd {
 			if sp.h.ID == rpi.ID {
-				con.updateRTInfo(time.Duration(now.UnixMilli()-rpi.SendTime)*time.Millisecond, uintptr(rpi.SendCount))
+				con.updateRTInfo(time.Duration(now-rpi.SendTime-(repTime-rpi.RecvTime))*time.Millisecond, uintptr(rpi.SendCount))
 
 				con.cWndSize -= int64(sp.sz)
 

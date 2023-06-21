@@ -1,7 +1,5 @@
 package p90
 
-import "sync"
-
 type indexedData struct {
 	ix  uint64
 	val interface{}
@@ -22,19 +20,13 @@ type sorter struct {
 	continuousLastID uint64
 	discretes        []indexedData
 	onAppend         func([]indexedData)
-	mtx              *sync.Mutex
 }
 
-func newSorter(mtx *sync.Mutex, onAppend func([]indexedData)) *sorter {
-	return &sorter{onAppend: onAppend, mtx: mtx}
+func newSorter(onAppend func([]indexedData)) *sorter {
+	return &sorter{onAppend: onAppend}
 }
 
 func (str *sorter) TryAdd(ix uint64, val interface{}) bool {
-	if str.mtx != nil {
-		str.mtx.Lock()
-		defer str.mtx.Unlock()
-	}
-
 	if ix <= str.continuousLastID {
 		return false
 	}
@@ -80,11 +72,6 @@ func (str *sorter) TryAdd(ix uint64, val interface{}) bool {
 }
 
 func (str *sorter) Has(ix uint64) bool {
-	if str.mtx != nil {
-		str.mtx.Lock()
-		defer str.mtx.Unlock()
-	}
-
 	if ix <= str.continuousLastID {
 		return true
 	}
@@ -96,11 +83,10 @@ func (str *sorter) Has(ix uint64) bool {
 	return false
 }
 
-func (str *sorter) ContinuousLastID() uint64 {
-	if str.mtx != nil {
-		str.mtx.Lock()
-		defer str.mtx.Unlock()
-	}
+func (str *sorter) NonContinuous() []indexedData {
+	return str.discretes
+}
 
+func (str *sorter) ContinuousLastID() uint64 {
 	return str.continuousLastID
 }

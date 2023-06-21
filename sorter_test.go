@@ -5,7 +5,7 @@ import (
 )
 
 func TestSorter(*testing.T) {
-	str := newSorter(nil, func(datas []indexedData) {
+	str := newSorter( func(datas []indexedData) {
 		for i, v := range datas {
 			if int(v.ix) != i+1 {
 				panic("v.ix != i")
