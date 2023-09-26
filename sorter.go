@@ -17,7 +17,7 @@ func newIndexedData(ix uint64, val interface{}) indexedData {
 }
 
 type sorter struct {
-	continuousLastID uint64
+	continuousLastIx uint64
 	discretes        []indexedData
 	onAppend         func([]indexedData)
 }
@@ -27,7 +27,7 @@ func newSorter(onAppend func([]indexedData)) *sorter {
 }
 
 func (str *sorter) TryAdd(ix uint64, val interface{}) bool {
-	if ix <= str.continuousLastID {
+	if ix <= str.continuousLastIx {
 		return false
 	}
 
@@ -57,7 +57,7 @@ func (str *sorter) TryAdd(ix uint64, val interface{}) bool {
 	}
 
 	sz := len(str.discretes)
-	if sz == 0 || str.discretes[0].ix-str.continuousLastID > 1 {
+	if sz == 0 || str.discretes[0].ix-str.continuousLastIx > 1 {
 		return true
 	}
 	i := 1
@@ -66,13 +66,13 @@ func (str *sorter) TryAdd(ix uint64, val interface{}) bool {
 	if str.onAppend != nil {
 		str.onAppend(str.discretes[:i])
 	}
-	str.continuousLastID = str.discretes[i-1].ix
+	str.continuousLastIx = str.discretes[i-1].ix
 	str.discretes = str.discretes[i:]
 	return true
 }
 
 func (str *sorter) Has(ix uint64) bool {
-	if ix <= str.continuousLastID {
+	if ix <= str.continuousLastIx {
 		return true
 	}
 	for _, data := range str.discretes {
@@ -83,10 +83,27 @@ func (str *sorter) Has(ix uint64) bool {
 	return false
 }
 
-func (str *sorter) NonContinuous() []indexedData {
+func (str *sorter) Discretes() []indexedData {
 	return str.discretes
 }
 
-func (str *sorter) ContinuousLastID() uint64 {
-	return str.continuousLastID
+func (str *sorter) ContinuousLastIndex() uint64 {
+	return str.continuousLastIx
+}
+
+func (str *sorter) TryApplyContinuousLastIndex(ix uint64) bool {
+	if ix <= str.continuousLastIx {
+		return false
+	}
+	for i, data := range str.discretes {
+		if data.ix > ix && data.ix-ix > 1 {
+			if str.onAppend != nil && i > 0 {
+				str.onAppend(str.discretes[:i])
+			}
+			str.discretes = str.discretes[:i]
+			break
+		}
+	}
+	str.continuousLastIx = ix
+	return true
 }

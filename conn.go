@@ -62,7 +62,7 @@ type Conn struct {
 	cWndErr     error
 
 	sentPkts *sorter
-	repPkts  *sorter
+	recvPkts *sorter
 
 	rDataBuf dataReadBuffer
 
@@ -89,7 +89,7 @@ func newConn(id uuid.UUID, locPr *Peer, rmtAddr net.Addr, isKeepAlived bool) *Co
 		wLastTime:         newAtomicTime(now),
 		cWndSizeMax:       2048 * 1024,
 		sentPkts:          newSorter(nil),
-		repPkts:           newSorter(nil),
+		recvPkts:          newSorter(nil),
 	}
 	con.cWndOnPush = sync.NewCond(&con.mtx)
 	con.cWndOnPop = sync.NewCond(&con.mtx)
@@ -189,42 +189,41 @@ func (con *Conn) handleRecv(from net.Addr, h *packetHeader, r *bytes.Buffer) err
 	}
 
 	if isReliablePT[h.Type] && h.ID > 0 {
-		rpi := &receivedPacketInfo{
+		curRPI := &receivedPacketInfo{
 			h.ID,
 			h.SendTime,
 			h.SendCount,
 			now,
 		}
+		isNew := con.recvPkts.TryAdd(h.ID, curRPI)
 
-		nc := con.repPkts.NonContinuous()
-		n := len(nc)
-		if n == 0 {
-			err := con.send(ptReceiveds, rpi)
-			if err != nil {
-				return err
-			}
-		} else {
-			if n > 32 {
-				n = 32
-			}
-			n++
+		nc := con.recvPkts.Discretes()
+		ncn := len(nc)
+		if ncn > 30 {
+			ncn = 30
+		}
+		body := make([]interface{}, 2, ncn+2)
 
-			rpis := make([]interface{}, 1, n)
-			rpis[0] = rpi
-			for _, data := range nc {
-				rpis = append(rpis, data.val.(*receivedPacketInfo))
-				if len(rpis) >= n {
-					break
-				}
-			}
+		body[0] = con.recvPkts.ContinuousLastIndex()
+		body[1] = curRPI
 
-			err := con.send(ptReceiveds, rpis...)
-			if err != nil {
-				return err
+		for _, data := range nc {
+			if len(body) >= ncn {
+				break
 			}
+			rpi := data.val.(*receivedPacketInfo)
+			if rpi == curRPI {
+				continue
+			}
+			body = append(body, rpi)
 		}
 
-		if !con.repPkts.TryAdd(h.ID, rpi) {
+		err := con.send(ptReceiveds, body...)
+		if err != nil {
+			return err
+		}
+
+		if !isNew {
 			return nil
 		}
 	}
@@ -237,9 +236,13 @@ func (con *Conn) handleRecv(from net.Addr, h *packetHeader, r *bytes.Buffer) err
 		con.rDataBuf.Put(r.Bytes())
 
 	case ptReceiveds:
+		var continuousLastID uint64
+		binary.Read(r, binary.LittleEndian, &continuousLastID)
+
 		rpis := make([]receivedPacketInfo, r.Len()/25)
 		binary.Read(r, binary.LittleEndian, &rpis)
-		err := con.cleanCWnd(now, h.SendTime, rpis...)
+
+		err := con.cleanCWnd(now, h.SendTime, continuousLastID, rpis...)
 		if err != nil {
 			con.close(err)
 			return err
@@ -529,8 +532,11 @@ func (con *Conn) updateRTInfo(rtt time.Duration, wCount uintptr) {
 	con.minIncRTT = 0
 }
 
-func (con *Conn) cleanCWnd(now, repTime int64, rpis ...receivedPacketInfo) error {
+func (con *Conn) cleanCWnd(now, repTime int64, continuousLastID uint64, rpis ...receivedPacketInfo) error {
 	isSent := false
+
+	var lastRPI *receivedPacketInfo
+
 	for _, rpi := range rpis {
 		if !con.sentPkts.TryAdd(rpi.ID, nil) {
 			continue
@@ -538,7 +544,9 @@ func (con *Conn) cleanCWnd(now, repTime int64, rpis ...receivedPacketInfo) error
 		isSent = true
 		for i, sp := range con.cWnd {
 			if sp.h.ID == rpi.ID {
-				con.updateRTInfo(time.Duration(now-rpi.SendTime-(repTime-rpi.RecvTime))*time.Millisecond, uintptr(rpi.SendCount))
+				if lastRPI == nil || lastRPI.ID < rpi.ID {
+					lastRPI = &rpi
+				}
 
 				con.cWndSize -= int64(sp.sz)
 
@@ -558,9 +566,42 @@ func (con *Conn) cleanCWnd(now, repTime int64, rpis ...receivedPacketInfo) error
 			}
 		}
 	}
+
+	if lastRPI != nil {
+		con.updateRTInfo(time.Duration(now-lastRPI.SendTime-(repTime-lastRPI.RecvTime))*time.Millisecond, uintptr(lastRPI.SendCount))
+	}
+
+	if con.sentPkts.TryApplyContinuousLastIndex(continuousLastID) {
+		var newCWnd []*sendingPkt
+		start := 0
+		for i, sp := range con.cWnd {
+			if sp.h.ID > continuousLastID {
+				continue
+			}
+			if newCWnd == nil {
+				newCWnd = make([]*sendingPkt, 0, len(con.cWnd))
+			}
+			con.cWndSize -= int64(sp.sz)
+			newCWnd = append(newCWnd, con.cWnd[start:i]...)
+			start = i + 1
+		}
+		if start > 0 {
+			isSent = true
+			oldCWndN := len(con.cWnd)
+			if start < oldCWndN {
+				if newCWnd == nil {
+					newCWnd = make([]*sendingPkt, 0, oldCWndN-start)
+				}
+				newCWnd = append(newCWnd, con.cWnd[start:]...)
+			}
+			con.cWnd = newCWnd
+		}
+	}
+
 	if isSent {
 		con.cWndOnPop.Broadcast()
 	}
+
 	return nil
 }
 
