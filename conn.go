@@ -2,6 +2,7 @@ package p90
 
 import (
 	"bytes"
+	"container/list"
 	"encoding/binary"
 	"errors"
 	"net"
@@ -54,7 +55,7 @@ type Conn struct {
 
 	lastPktID uint64
 
-	cWnd        []*sendingPkt
+	cWnd        *list.List
 	cWndSize    int64
 	cWndSizeMax int64
 	cWndOnPush  *sync.Cond
@@ -87,6 +88,7 @@ func newConn(id uuid.UUID, locPr *Peer, rmtAddr net.Addr, isKeepAlived bool) *Co
 		isKeepAlived:      isKeepAlived,
 		rLastTime:         newAtomicTime(now),
 		wLastTime:         newAtomicTime(now),
+		cWnd:              list.New(),
 		cWndSizeMax:       2048 * 1024,
 		sentPkts:          newSorter(nil),
 		recvPkts:          newSorter(nil),
@@ -198,7 +200,7 @@ func (con *Conn) handleRecv(from net.Addr, h *packetHeader, r *bytes.Buffer) err
 		isNew := con.recvPkts.TryAdd(h.ID, curRPI)
 
 		nc := con.recvPkts.Discretes()
-		ncn := len(nc)
+		ncn := nc.Len()
 		if ncn > 30 {
 			ncn = 30
 		}
@@ -207,7 +209,8 @@ func (con *Conn) handleRecv(from net.Addr, h *packetHeader, r *bytes.Buffer) err
 		body[0] = con.recvPkts.ContinuousLastIndex()
 		body[1] = curRPI
 
-		for _, data := range nc {
+		for it := nc.Front(); it != nil; it = it.Next() {
+			data := it.Value.(*indexedData)
 			if len(body) >= ncn {
 				break
 			}
@@ -405,7 +408,7 @@ func (con *Conn) send(typ byte, others ...interface{}) error {
 		return nil
 	}
 
-	con.cWnd = append(con.cWnd, sp)
+	con.cWnd.PushBack(sp)
 	con.cWndOnPush.Signal()
 	return nil
 }
@@ -458,7 +461,8 @@ func (con *Conn) handleWTO() (time.Duration, error) {
 	dur := resendTimeout
 
 	now := time.Now()
-	for _, sp := range con.cWnd {
+	for it := con.cWnd.Front(); it != nil; it = it.Next() {
+		sp := it.Value.(*sendingPkt)
 		if now.Sub(sp.wFirstTime) > wTimeout.Get() {
 			if atomic.LoadUintptr(&con.isHandshaked) == 0 {
 				return -1, errHandshakingTimeout
@@ -542,26 +546,14 @@ func (con *Conn) cleanCWnd(now, repTime int64, continuousLastID uint64, rpis ...
 			continue
 		}
 		isSent = true
-		for i, sp := range con.cWnd {
+		for it := con.cWnd.Front(); it != nil; it = it.Next() {
+			sp := it.Value.(*sendingPkt)
 			if sp.h.ID == rpi.ID {
 				if lastRPI == nil || lastRPI.ID < rpi.ID {
 					lastRPI = &rpi
 				}
-
 				con.cWndSize -= int64(sp.sz)
-
-				if i == 0 {
-					con.cWnd = con.cWnd[1:]
-					break
-				}
-				if i == len(con.cWnd)-1 {
-					con.cWnd = con.cWnd[:i]
-					break
-				}
-				cWndRights := make([]*sendingPkt, len(con.cWnd[i+1:]))
-				copy(cWndRights, con.cWnd[i+1:])
-				con.cWnd = con.cWnd[:len(con.cWnd)-1]
-				copy(con.cWnd[i:], cWndRights)
+				con.cWnd.Remove(it)
 				break
 			}
 		}
@@ -572,29 +564,16 @@ func (con *Conn) cleanCWnd(now, repTime int64, continuousLastID uint64, rpis ...
 	}
 
 	if con.sentPkts.TryApplyContinuousLastIndex(continuousLastID) {
-		var newCWnd []*sendingPkt
-		start := 0
-		for i, sp := range con.cWnd {
+		for it := con.cWnd.Front(); it != nil; {
+			sp := it.Value.(*sendingPkt)
 			if sp.h.ID > continuousLastID {
-				continue
+				break
 			}
-			if newCWnd == nil {
-				newCWnd = make([]*sendingPkt, 0, len(con.cWnd))
-			}
-			con.cWndSize -= int64(sp.sz)
-			newCWnd = append(newCWnd, con.cWnd[start:i]...)
-			start = i + 1
-		}
-		if start > 0 {
 			isSent = true
-			oldCWndN := len(con.cWnd)
-			if start < oldCWndN {
-				if newCWnd == nil {
-					newCWnd = make([]*sendingPkt, 0, oldCWndN-start)
-				}
-				newCWnd = append(newCWnd, con.cWnd[start:]...)
-			}
-			con.cWnd = newCWnd
+			con.cWndSize -= int64(sp.sz)
+			next := it.Next()
+			con.cWnd.Remove(it)
+			it = next
 		}
 	}
 

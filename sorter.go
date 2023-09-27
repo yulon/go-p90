@@ -1,29 +1,33 @@
 package p90
 
+import (
+	"container/list"
+)
+
 type indexedData struct {
 	ix  uint64
 	val interface{}
 }
 
-func newIndexedData(ix uint64, val interface{}) indexedData {
+func newIndexedData(ix uint64, val interface{}) *indexedData {
 	switch val.(type) {
 	case []byte:
 		dataSrc := val.([]byte)
 		dataCpy := make([]byte, len(dataSrc))
 		copy(dataCpy, dataSrc)
-		return indexedData{ix, dataCpy}
+		return &indexedData{ix, dataCpy}
 	}
-	return indexedData{ix, val}
+	return &indexedData{ix, val}
 }
 
 type sorter struct {
 	continuousLastIx uint64
-	discretes        []indexedData
-	onAppend         func([]indexedData)
+	discretes        *list.List
+	onMerge          func([]*indexedData)
 }
 
-func newSorter(onAppend func([]indexedData)) *sorter {
-	return &sorter{onAppend: onAppend}
+func newSorter(onMerge func([]*indexedData)) *sorter {
+	return &sorter{onMerge: onMerge, discretes: list.New()}
 }
 
 func (str *sorter) TryAdd(ix uint64, val interface{}) bool {
@@ -32,42 +36,70 @@ func (str *sorter) TryAdd(ix uint64, val interface{}) bool {
 	}
 
 	isInst := false
-	for i, data := range str.discretes {
+	for it := str.discretes.Front(); it != nil; it = it.Next() {
+		data := it.Value.(*indexedData)
 		if ix == data.ix {
 			return false
 		}
 		if ix < data.ix {
-			a := str.discretes[:i]
-			b := []indexedData{newIndexedData(ix, val)}
-			c := str.discretes[i:]
-			str.discretes = make([]indexedData, len(a)+len(b)+len(c))
-			copy(str.discretes, a)
-			copy(str.discretes[len(a):], b)
-			copy(str.discretes[len(a)+len(b):], c)
+			str.discretes.InsertBefore(newIndexedData(ix, val), it)
 			isInst = true
 			break
 		}
 	}
-	if !isInst {
-		if len(str.discretes) == 0 {
-			str.discretes = []indexedData{newIndexedData(ix, val)}
-		} else if ix > str.discretes[len(str.discretes)-1].ix {
-			str.discretes = append(str.discretes, newIndexedData(ix, val))
-		}
+	if !isInst && (str.discretes.Len() == 0 || ix > str.discretes.Back().Value.(*indexedData).ix) {
+		str.discretes.PushBack(newIndexedData(ix, val))
 	}
 
-	sz := len(str.discretes)
-	if sz == 0 || str.discretes[0].ix-str.continuousLastIx > 1 {
+	n := str.discretes.Len()
+	if n == 0 {
 		return true
 	}
-	i := 1
-	for ; i < sz && str.discretes[i].ix-str.discretes[i-1].ix == 1; i++ {
+	frontIx := str.discretes.Front().Value.(*indexedData).ix
+	frontDiff := frontIx - str.continuousLastIx
+	if frontDiff > 1 {
+		return true
 	}
-	if str.onAppend != nil {
-		str.onAppend(str.discretes[:i])
+	if frontDiff == 0 {
+		panic(frontDiff)
 	}
-	str.continuousLastIx = str.discretes[i-1].ix
-	str.discretes = str.discretes[i:]
+
+	newFront := str.discretes.Front().Next()
+	c := 1
+	for ; newFront != nil; newFront = newFront.Next() {
+		data := newFront.Value.(*indexedData)
+		prevData := newFront.Prev().Value.(*indexedData)
+		if data.ix-prevData.ix > 1 {
+			break
+		}
+		c++
+	}
+
+	if newFront != nil {
+		str.continuousLastIx = newFront.Prev().Value.(*indexedData).ix
+	} else {
+		str.continuousLastIx = str.discretes.Back().Value.(*indexedData).ix
+	}
+
+	var merges []*indexedData
+	for it := str.discretes.Front(); it != nil; {
+		data := it.Value.(*indexedData)
+		if data.ix > str.continuousLastIx {
+			break
+		}
+		if str.onMerge != nil {
+			if merges == nil {
+				merges = make([]*indexedData, 0, c)
+			}
+			merges = append(merges, data)
+		}
+		next := it.Next()
+		str.discretes.Remove(it)
+		it = next
+	}
+	if len(merges) > 0 {
+		str.onMerge(merges)
+	}
 	return true
 }
 
@@ -75,7 +107,8 @@ func (str *sorter) Has(ix uint64) bool {
 	if ix <= str.continuousLastIx {
 		return true
 	}
-	for _, data := range str.discretes {
+	for it := str.discretes.Front(); it != nil; it = it.Next() {
+		data := it.Value.(*indexedData)
 		if ix == data.ix {
 			return true
 		}
@@ -83,7 +116,7 @@ func (str *sorter) Has(ix uint64) bool {
 	return false
 }
 
-func (str *sorter) Discretes() []indexedData {
+func (str *sorter) Discretes() *list.List {
 	return str.discretes
 }
 
@@ -95,15 +128,23 @@ func (str *sorter) TryApplyContinuousLastIndex(ix uint64) bool {
 	if ix <= str.continuousLastIx {
 		return false
 	}
-	for i, data := range str.discretes {
+	str.continuousLastIx = ix
+
+	merges := make([]*indexedData, 0)
+	for it := str.discretes.Front(); it != nil; {
+		data := it.Value.(*indexedData)
 		if data.ix > ix && data.ix-ix > 1 {
-			if str.onAppend != nil && i > 0 {
-				str.onAppend(str.discretes[:i])
-			}
-			str.discretes = str.discretes[:i]
 			break
 		}
+		if str.onMerge != nil {
+			merges = append(merges, data)
+		}
+		next := it.Next()
+		str.discretes.Remove(it)
+		it = next
 	}
-	str.continuousLastIx = ix
+	if len(merges) > 0 {
+		str.onMerge(merges)
+	}
 	return true
 }
