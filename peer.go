@@ -42,9 +42,11 @@ func (pr *Peer) tryRespCloseTo(addr net.Addr, h *packetHeader) bool {
 	if h.Type != ptClose {
 		return false
 	}
-	h.Type = ptReceiveds
 	h.ID = 0
-	pr.writeTo(makePacket(h), addr)
+	h.Type = ptReceiveds
+	h.SendCount = 1
+	h.SendTime = 0
+	pr.writeTo(makePacket(h, uint64(18446744073709551615)), addr)
 	return true
 }
 
@@ -80,9 +82,7 @@ func (pr *Peer) bypassRecv(from net.Addr, to net.PacketConn, h *packetHeader, p 
 			}
 		}
 	}
-	if con.handleRecv(from, h, r) != nil {
-		pr.tryRespCloseTo(from, h)
-	}
+	con.recvCh <- &recvPkt{from, *h, r}
 }
 
 func listen(pktCon net.PacketConn, isUnique bool) (*Peer, error) {
