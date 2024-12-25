@@ -35,28 +35,30 @@ type Conn struct {
 
 	state atomic.Uintptr
 
-	handshakeTimeout *atomicDur
-	isHandshaked     atomic.Uintptr
+	isHandshaked bool
 
-	wTimeout    *atomicDur
-	idleTimeout *atomicDur
+	wTimeout    atomicDur
+	idleTimeout atomicDur
 
-	rtt    *atomicDur
-	rtsc   atomic.Uintptr
-	minRTT *atomicDur
-	rtts   []time.Duration
-	rttSum time.Duration
-	rttAvg time.Duration
+	rtt          atomicDur
+	rtsc         atomic.Uintptr
+	minRTT       atomicDur
+	rtts         []time.Duration
+	rttSum       time.Duration
+	rttAvg       time.Duration
+	rttFromPktID uint64
 
-	wLastTime *atomicTime
-	rLastTime *atomicTime
+	wLastTime atomicTime
+	rLastTime atomicTime
 
-	isKeepAlived  atomic.Uintptr
-	isWaitingFine atomic.Uintptr
+	isKeepAlived  bool
+	isWaitingFine bool
 
 	lastPktID atomic.Uint64
 
 	cWndSizeMax atomic.Int64
+
+	gots *sorter
 
 	sendCh chan *sendingCtx
 	recvCh chan *recvPkt
@@ -74,23 +76,21 @@ type Conn struct {
 func newConn(id uuid.UUID, locPr *Peer, rmtAddr net.Addr, isKeepAlived bool) *Conn {
 	now := time.Now()
 	con := &Conn{
-		id:               id,
-		locPr:            locPr,
-		rmtAddr:          rmtAddr,
-		rtt:              newAtomicDur(DefaultRTT),
-		minRTT:           newAtomicDur(DefaultRTT),
-		rttAvg:           DefaultRTT,
-		handshakeTimeout: newAtomicDur(100 * time.Second),
-		wTimeout:         newAtomicDur(10 * time.Second),
-		idleTimeout:      newAtomicDur(90 * time.Second),
-		rLastTime:        newAtomicTime(now),
-		wLastTime:        newAtomicTime(now),
+		id:           id,
+		locPr:        locPr,
+		rmtAddr:      rmtAddr,
+		wTimeout:     newAtomicDur(30 * time.Second),
+		idleTimeout:  newAtomicDur(time.Minute),
+		rtt:          newAtomicDur(DefaultRTT),
+		minRTT:       newAtomicDur(DefaultRTT),
+		rttAvg:       DefaultRTT,
+		rLastTime:    newAtomicTime(now),
+		wLastTime:    newAtomicTime(now),
+		isKeepAlived: isKeepAlived,
+		gots:         newSorter(nil),
 	}
 	con.rtsc.Store(1)
-	if isKeepAlived {
-		con.isKeepAlived.Store(1)
-	}
-	con.cWndSizeMax.Store(2048 * 1024)
+	con.cWndSizeMax.Store(1024)
 	con.sendCh = make(chan *sendingCtx)
 	con.recvCh = make(chan *recvPkt)
 	con.stopCh = make(chan error)
@@ -170,57 +170,117 @@ type recvPkt struct {
 	body *bytes.Buffer
 }
 
-func (con *Conn) handleRecv(cWndPkts *list.List, sentPkts *sorter, recvPkts *sorter, rp *recvPkt) (int64, error) {
+func (con *Conn) handleRecv(cWnd *list.List, sents *sorter, lstRepMoreTm *int64, rp *recvPkt) (fstRecv bool, unsendN int64, err error) {
 	now := time.Now().UnixMilli()
 
 	con.rLastTime.Set(time.Now())
-	con.isWaitingFine.CompareAndSwap(1, 0)
-	con.isHandshaked.CompareAndSwap(0, 1)
+
+	if con.isHandshaked {
+		con.isWaitingFine = false
+	} else {
+		con.isHandshaked = true
+		fstRecv = true
+	}
 
 	con.wMtx.Lock()
 	con.rmtAddr = rp.from
 	con.wMtx.Unlock()
 
 	if isReliablePT[rp.h.Type] && rp.h.ID > 0 {
-		curRPI := &receivedPacketInfo{
-			rp.h.ID,
-			rp.h.SendTime,
-			rp.h.SendCount,
+		curRC := &replyingCtx{
+			gotPkt{
+				rp.h.ID,
+				rp.h.SendCount,
+				0,
+			},
 			now,
 		}
-		isNew := recvPkts.TryAdd(rp.h.ID, curRPI)
 
-		nc := recvPkts.Discretes()
-		ncn := nc.Len()
-		if ncn > 30 {
-			ncn = 30
-		}
-		body := make([]interface{}, 2, ncn+2)
+		isNew := con.gots.TryAdd(curRC)
+		rcs := con.gots.Nondense()
+		var body []interface{}
 
-		body[0] = recvPkts.ContinuousLastIndex()
-		body[1] = curRPI
+		/*if !isNew {
+			for it := rcs.Front(); it != nil; it = it.Next() {
+				rc := it.Value.(*replyingCtx)
 
-		for it := nc.Front(); it != nil; it = it.Next() {
-			data := it.Value.(*indexedData)
-			if len(body) >= ncn {
-				break
+				if rc.Index() == curRC.Index() {
+					rc.updateGotElapsed(now)
+					curRC = rc
+					break
+				}
 			}
-			rpi := data.val.(*receivedPacketInfo)
-			if rpi == curRPI {
+		}
+		for it := rcs.Front(); it != nil && len(body) < 3; it = it.Next() {
+			rc := it.Value.(*replyingCtx)
+
+			if rc.Index() == curRC.Index() {
 				continue
 			}
-			body = append(body, rpi)
+
+			rc.updateGotElapsed(now)
+			body = append(body, rc)
+		}*/
+
+		if isNew {
+			if curRC.ID > con.gots.DenseLastIndex() {
+				body = append(body, curRC)
+			}
+		} else {
+			repMore := false
+			if now-*lstRepMoreTm > int64(con.rtt.Get()/time.Millisecond) {
+				*lstRepMoreTm = now
+				repMore = true
+			}
+			if curRC.ID <= con.gots.DenseLastIndex() {
+				if repMore {
+					for it := rcs.Front(); it != nil && len(body) < 32; it = it.Next() {
+						rc := it.Value.(*replyingCtx)
+						rc.updateGotElapsed(now)
+						body = append(body, rc)
+					}
+				}
+			} else {
+				for it := rcs.Back(); it != nil; it = it.Prev() {
+					rc := it.Value.(*replyingCtx)
+					if rc.Index() != curRC.Index() {
+						continue
+					}
+
+					rc.updateGotElapsed(now)
+					body = append(body, rc)
+
+					if !repMore {
+						break
+					}
+
+					for jt := it.Prev(); jt != nil && len(body) < 32; jt = jt.Prev() {
+						rc := jt.Value.(*replyingCtx)
+						rc.updateGotElapsed(now)
+						body = append(body, rc)
+					}
+
+					for jt := it.Next(); jt != nil && len(body) < 32; jt = jt.Next() {
+						rc := jt.Value.(*replyingCtx)
+						rc.updateGotElapsed(now)
+						body = append(body, rc)
+					}
+					break
+				}
+			}
 		}
 
-		err := con.sendOnce(ptReceiveds, body...)
+		err = con.sendOnce(ptGots, body...)
 		if err != nil {
-			return 0, err
+			return
 		}
 
 		if !isNew {
-			return 0, nil
+			return
 		}
 	}
+
+	var rmtGotNondense []gotPkt
 
 	switch rp.h.Type {
 
@@ -229,20 +289,13 @@ func (con *Conn) handleRecv(cWndPkts *list.List, sentPkts *sorter, recvPkts *sor
 	case ptUnreliableData:
 		con.rDataBuf.Put(rp.body.Bytes())
 
-	case ptReceiveds:
-		var continuousLastID uint64
-		binary.Read(rp.body, binary.LittleEndian, &continuousLastID)
-
-		rpis := make([]receivedPacketInfo, rp.body.Len()/25)
-		binary.Read(rp.body, binary.LittleEndian, &rpis)
-
-		return con.unsends(cWndPkts, sentPkts, now, rp.h.SendTime, continuousLastID, rpis...), nil
-
-	case ptRequests:
+	case ptGots:
+		rmtGotNondense = make([]gotPkt, rp.body.Len()/25)
+		binary.Read(rp.body, binary.LittleEndian, &rmtGotNondense)
 
 	case ptClose:
 		con.close(errClosedByRemote)
-		return 0, nil
+		return
 
 	case ptStreamData:
 		var strmPktIx uint64
@@ -250,7 +303,9 @@ func (con *Conn) handleRecv(cWndPkts *list.List, sentPkts *sorter, recvPkts *sor
 		con.rStrmBuf.Put(strmPktIx, rp.body.Bytes())
 	}
 
-	return 0, nil
+	unsendN = con.unsends(cWnd, sents, now, &rp.h.GotDenseLast, rmtGotNondense)
+
+	return
 }
 
 var errDataSizeOverflow = errors.New("data size overflow")
@@ -280,38 +335,43 @@ const dur3sec = 3 * time.Second
 
 var errRecvTimeout = errors.New("receiving timeout")
 
-func (con *Conn) handleRTO() time.Duration {
+func (con *Conn) checkAlive() (time.Duration, error) {
 	now := time.Now()
-
-	if con.isKeepAlived.Load() != 0 { // TODO: move to resends()
-		wto := con.wTimeout.Get()
-		if con.isHandshaked.Load() == 1 && con.isWaitingFine.Swap(1) == 0 {
-			if con.state.Load() == csNormal {
-				con.sendOnce(ptHowAreYou)
-			}
-		}
-		return wto + wto/2
-	}
 
 	ito := con.idleTimeout.Get()
 	if ito == 0 {
-		return -1
+		return -1, nil
 	}
-	rEla := now.Sub(con.rLastTime.Get())
-	wEla := now.Sub(con.wLastTime.Get())
-	rRem := ito - rEla
-	wRem := ito - wEla
-	if rRem > 0 {
-		if wRem > 0 {
-			if wRem < rRem {
-				return wRem
-			}
-			return rRem
+
+	var dur time.Duration
+
+	rt := con.rLastTime.Get()
+	if !rt.IsZero() {
+		dur = now.Sub(rt)
+	}
+
+	wt := con.wLastTime.Get()
+	if !wt.IsZero() {
+		wDur := now.Sub(wt)
+		if wDur < dur {
+			dur = wDur
 		}
 	}
 
-	con.close(errRecvTimeout)
-	return -1
+	if dur == 0 {
+		return -1, nil
+	}
+
+	rem := ito - dur
+	if rem > 0 {
+		/*if con.isKeepAlived && rem < ito/2 && con.isHandshaked && !con.isWaitingFine && con.state.Load() == csNormal {
+			con.isWaitingFine = true
+			con.sendOnce(ptHowAreYou)
+		}*/
+		return rem, nil
+	}
+
+	return -1, errRecvTimeout
 }
 
 var errResendMaximum = errors.New("send count has been maximum")
@@ -327,8 +387,14 @@ func (con *Conn) sendHeaderAndBody(now time.Time, h *packetHeader, body []byte) 
 
 	con.wLastTime.Set(now)
 
-	h.SendTime = now.UnixMilli()
 	h.SendCount++
+
+	ml := con.gots.DenseLast()
+	if ml == nil {
+		h.GotDenseLast.ID = 0
+	} else {
+		h.GotDenseLast = ml.(*replyingCtx).gotPkt
+	}
 
 	con.wMtx.Lock()
 	defer con.wMtx.Unlock()
@@ -337,10 +403,9 @@ func (con *Conn) sendHeaderAndBody(now time.Time, h *packetHeader, body []byte) 
 }
 
 type sendingCtx struct {
-	h          *packetHeader
-	body       []byte
-	wFirstTime time.Time
-	wLastTime  time.Time
+	h      *packetHeader
+	body   []byte
+	wTimes []time.Time
 }
 
 var packetHeaderSz = binary.Size(packetHeader{})
@@ -351,10 +416,8 @@ func (sc *sendingCtx) Size() int {
 
 func (con *Conn) newHeader(typ byte) *packetHeader {
 	ph := &packetHeader{
-		Checksum:  MagicNumber,
-		ConID:     con.id,
-		Type:      typ,
-		SendCount: 0,
+		ConID: con.id,
+		Type:  typ,
 	}
 	if isReliablePT[typ] {
 		ph.ID = con.lastPktID.Add(1)
@@ -375,10 +438,7 @@ func (con *Conn) addSend(typ byte, others ...interface{}) error {
 
 func (con *Conn) send(sc *sendingCtx) error {
 	now := time.Now()
-	if sc.wFirstTime.IsZero() {
-		sc.wFirstTime = now
-	}
-	sc.wLastTime = now
+	sc.wTimes = append(sc.wTimes, now)
 	_, err := con.sendHeaderAndBody(now, sc.h, sc.body)
 	return err
 }
@@ -391,42 +451,34 @@ func (con *Conn) sendOnce(typ byte, others ...interface{}) error {
 var errHandshakingTimeout = errors.New("handshaking timeout")
 var errSendingTimeout = errors.New("sending a packet timeout")
 
-func (con *Conn) resends(cWndPkts *list.List) (time.Duration, error) {
-	if cWndPkts.Len() == 0 {
+func (con *Conn) resends(cWnd *list.List) (time.Duration, error) {
+	if cWnd.Len() == 0 {
 		return -1, nil
 	}
 
-	wTimeout := con.wTimeout
-	if con.isHandshaked.Load() == 0 && con.handshakeTimeout.Get() < con.wTimeout.Get() {
-		wTimeout = con.handshakeTimeout
+	rttRef := con.rtt.Get()
+	if rttRef == 0 {
+		rttRef = DefaultRTT
 	}
-
-	rttAvg := con.rttAvg
-	if rttAvg == 0 {
-		rttAvg = DefaultRTT
-	}
-	resendTimeout := rttAvg + rttAvg/8
-	dur := resendTimeout
+	resendTimeout := rttRef + rttRef/8
+	nextDur := resendTimeout
 
 	now := time.Now()
-	for it := cWndPkts.Front(); it != nil; it = it.Next() {
+	for it := cWnd.Front(); it != nil; it = it.Next() {
 		sc := it.Value.(*sendingCtx)
-		if sc.wFirstTime.IsZero() {
+		if len(sc.wTimes) == 0 {
 			panic(sc)
 		}
-		if now.Sub(sc.wFirstTime) > wTimeout.Get() {
-			if con.isHandshaked.Load() == 0 {
+		if now.Sub(sc.wTimes[0]) > con.wTimeout.Get() {
+			if !con.isHandshaked {
 				return -1, errHandshakingTimeout
 			}
 			return -1, errSendingTimeout
 		}
-		if sc.wLastTime.IsZero() {
-			panic(sc)
-		}
-		rem := resendTimeout - now.Sub(sc.wLastTime)
+		rem := resendTimeout - now.Sub(sc.wTimes[len(sc.wTimes)-1])
 		if rem > 0 {
-			if rem < dur {
-				dur = rem
+			if rem < nextDur {
+				nextDur = rem
 			}
 			continue
 		}
@@ -435,17 +487,18 @@ func (con *Conn) resends(cWndPkts *list.List) (time.Duration, error) {
 			return -1, err
 		}
 	}
-	return dur, nil
+	return nextDur, nil
 }
 
 func (con *Conn) handleIO() {
-	cWndPkts := list.New()
-	cWndSize := int64(0)
+	cWnd := list.New()
+	//cWndSize := int64(0)
 
-	sentPkts := newSorter(nil)
-	recvPkts := newSorter(nil)
+	sents := newSorter(nil)
+	var lstRepMoreTm int64
 
-	wakeTk := time.NewTicker(time.Hour)
+	resendTk := time.NewTicker(time.Hour)
+	checkAliveTk := time.NewTicker(time.Hour)
 
 	var stopErr, closedErr error
 
@@ -464,15 +517,20 @@ func (con *Conn) handleIO() {
 		var sc *sendingCtx
 		var rp *recvPkt
 		trySendClose := false
+		onResend := false
+		onCheckAlive := false
 
-		if cWndSize < con.cWndSizeMax.Load() {
+		if cWnd.Len() < int(con.cWndSizeMax.Load()) {
 			select {
 			case sc = <-con.sendCh:
 			case rp = <-con.recvCh:
 			case stopErr = <-con.stopCh:
 				trySendClose = true
 			case closedErr = <-con.closedErrCh:
-			case <-wakeTk.C:
+			case <-resendTk.C:
+				onResend = true
+			case <-checkAliveTk.C:
+				onCheckAlive = true
 			}
 		} else {
 			select {
@@ -480,7 +538,10 @@ func (con *Conn) handleIO() {
 			case stopErr = <-con.stopCh:
 				trySendClose = true
 			case closedErr = <-con.closedErrCh:
-			case <-wakeTk.C:
+			case <-resendTk.C:
+				onResend = true
+			case <-checkAliveTk.C:
+				onCheckAlive = true
 			}
 		}
 
@@ -490,16 +551,22 @@ func (con *Conn) handleIO() {
 		}
 
 		if rp != nil {
-			popSz, err := con.handleRecv(cWndPkts, sentPkts, recvPkts, rp)
+			fstRecv, unsendN, err := con.handleRecv(cWnd, sents, &lstRepMoreTm, rp)
 			if err != nil {
 				con.close(err)
 				continue
 			}
-			if popSz == 0 {
+			if fstRecv {
+				ito := con.idleTimeout.Get()
+				if ito > 0 {
+					checkAliveTk.Reset(ito)
+				}
+			}
+			if unsendN == 0 {
 				continue
 			}
-			cWndSize -= popSz
-			if cWndPkts.Len() > 0 {
+			//cWndSize -= popSz
+			if cWnd.Len() > 0 {
 				continue
 			}
 			if stopErr == nil {
@@ -513,7 +580,7 @@ func (con *Conn) handleIO() {
 		}
 
 		if trySendClose {
-			if cWndPkts.Len() > 0 || !con.state.CompareAndSwap(csStoping, csClosing) {
+			if cWnd.Len() > 0 || !con.state.CompareAndSwap(csStoping, csClosing) {
 				continue
 			}
 			sc = con.newSend(ptClose)
@@ -531,31 +598,51 @@ func (con *Conn) handleIO() {
 			if !isReliablePT[sc.h.Type] {
 				continue
 			}
-			cWndSize += int64(len(sc.body))
-			cWndPkts.PushBack(sc)
+			//cWndSize += int64(len(sc.body))
+			cWnd.PushBack(sc)
+			onResend = true
 		}
 
-		dur, err := con.resends(cWndPkts)
-		if err != nil {
-			con.close(err)
-			continue
-		}
-		if dur < 0 {
-			wakeTk.Reset(time.Hour)
+		if onResend {
+			dur, err := con.resends(cWnd)
+			if err != nil {
+				con.close(err)
+				continue
+			}
+			if dur < 0 {
+				resendTk.Reset(time.Hour)
+				continue
+			}
+			resendTk.Reset(dur)
 			continue
 		}
 
-		wakeTk.Reset(dur)
+		if onCheckAlive {
+			dur, err := con.checkAlive()
+			if err != nil {
+				con.close(err)
+				continue
+			}
+			if dur < 0 {
+				checkAliveTk.Reset(time.Hour)
+				continue
+			}
+			checkAliveTk.Reset(dur)
+			continue
+		}
 	}
 }
 
-func (con *Conn) updateRTInfo(rtt time.Duration, wCount uintptr) {
-	con.rtt.Set(rtt)
+func (con *Conn) updateRTInfo(fromPktID uint64, rtt time.Duration, wCount uintptr) {
+	if fromPktID <= con.rttFromPktID {
+		return
+	}
+	con.rttFromPktID = fromPktID
 
+	con.rtt.Set(rtt)
 	if rtt < con.minRTT.Get() {
 		con.minRTT.Set(rtt)
 	}
-
 	con.rtsc.Store(wCount)
 
 	if len(con.rtts) < 10 {
@@ -571,57 +658,68 @@ func (con *Conn) updateRTInfo(rtt time.Duration, wCount uintptr) {
 	con.rttAvg = con.rttSum / time.Duration(len(con.rtts))
 }
 
-type receivedInfo struct {
-	recvRepTime      int64
-	repTime          int64
-	continuousLastID uint64
-	rpis             []receivedPacketInfo
-}
+func (con *Conn) unsends(cWnd *list.List, sents *sorter, now int64, denseLast *gotPkt, nondense []gotPkt) int64 {
+	unsendN := int64(0)
 
-func (con *Conn) unsends(cWndPkts *list.List, sentPkts *sorter, recvRepTime int64, repTime int64, continuousLastID uint64, rpis ...receivedPacketInfo) int64 {
-	popSz := int64(0)
+	var lstGP *gotPkt
+	var lstSC *sendingCtx
 
-	var lastRPI *receivedPacketInfo
-
-	for _, rpi := range rpis {
-		if !sentPkts.TryAdd(rpi.ID, nil) {
-			continue
-		}
-		for it := cWndPkts.Front(); it != nil; it = it.Next() {
+	if denseLast != nil && denseLast.ID > 0 && sents.TryChangeDenseLast(indexed(denseLast.ID)) {
+		for it := cWnd.Front(); it != nil; {
 			sc := it.Value.(*sendingCtx)
-			if sc.h.ID == rpi.ID {
-				if lastRPI == nil || lastRPI.ID < rpi.ID {
-					lastRPI = &rpi
-				}
-
-				popSz += int64(sc.Size())
-
-				cWndPkts.Remove(it)
-				break
-			}
-		}
-	}
-
-	if lastRPI != nil {
-		con.updateRTInfo(time.Duration(recvRepTime-lastRPI.SendTime-(repTime-lastRPI.RecvTime))*time.Millisecond, uintptr(lastRPI.SendCount))
-	}
-
-	if sentPkts.TryApplyContinuousLastIndex(continuousLastID) {
-		for it := cWndPkts.Front(); it != nil; {
-			sc := it.Value.(*sendingCtx)
-			if sc.h.ID > continuousLastID {
+			if sc.h.ID > denseLast.ID {
 				break
 			}
 
-			popSz += int64(sc.Size())
+			unsendN++
 
 			next := it.Next()
-			cWndPkts.Remove(it)
+			cWnd.Remove(it)
 			it = next
+
+			if sc.h.ID == denseLast.ID {
+				lstGP = denseLast
+				lstSC = sc
+				break
+			}
 		}
 	}
 
-	return popSz
+	for _, gp := range nondense {
+		if !sents.TryAdd(indexed(gp.ID)) {
+			continue
+		}
+		for it := cWnd.Front(); it != nil; it = it.Next() {
+			sc := it.Value.(*sendingCtx)
+			if sc.h.ID > gp.ID {
+				break
+			}
+			if sc.h.ID != gp.ID {
+				continue
+			}
+
+			if lstGP == nil || lstGP.ID < gp.ID {
+				lstGP = &gotPkt{gp.ID, gp.SendCount, gp.GotElapsed}
+				lstSC = sc
+			}
+
+			wt := time.Duration(now-sc.wTimes[0].UnixMilli()*2) * time.Millisecond
+			if wt > con.wTimeout.Get() {
+				con.wTimeout.Set(wt)
+			}
+
+			unsendN++
+
+			cWnd.Remove(it)
+			break
+		}
+	}
+
+	if lstSC != nil && lstGP.SendCount > 0 && int(lstGP.SendCount) <= len(lstSC.wTimes) {
+		con.updateRTInfo(lstGP.ID, time.Duration(now-lstSC.wTimes[lstGP.SendCount-1].UnixMilli()-lstGP.GotElapsed)*time.Millisecond, uintptr(lstGP.SendCount))
+	}
+
+	return unsendN
 }
 
 func (con *Conn) WritePacketOnce(data []byte) (int, error) {

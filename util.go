@@ -26,16 +26,13 @@ func makePacketBody(others ...interface{}) []byte {
 	return buf.Bytes()
 }
 
-func writePacket(buf *bytes.Buffer, h *packetHeader, others ...interface{}) {
-	h.Checksum = CalcPacketHeaderChecksum(h)
-	binary.Write(buf, binary.LittleEndian, h)
-	writePacketBody(buf, others...)
-}
-
 func makePacket(h *packetHeader, others ...interface{}) []byte {
 	buf := bytes.NewBuffer(nil)
-	writePacket(buf, h, others...)
-	return buf.Bytes()
+	binary.Write(buf, binary.LittleEndian, h)
+	writePacketBody(buf, others...)
+	p := buf.Bytes()
+	p[0] = CalcPacketChecksum(p)
+	return p
 }
 
 var ipv4Localhost = net.ParseIP("127.0.0.1")
@@ -56,8 +53,8 @@ type atomicTime struct {
 	val int64
 }
 
-func newAtomicTime(t time.Time) *atomicTime {
-	return &atomicTime{t.Unix()}
+func newAtomicTime(t time.Time) atomicTime {
+	return atomicTime{t.Unix()}
 }
 
 func (at *atomicTime) Set(t time.Time) {
@@ -72,8 +69,8 @@ type atomicDur struct {
 	val int64
 }
 
-func newAtomicDur(d time.Duration) *atomicDur {
-	return &atomicDur{int64(d)}
+func newAtomicDur(d time.Duration) atomicDur {
+	return atomicDur{int64(d)}
 }
 
 func (ad *atomicDur) Set(d time.Duration) {

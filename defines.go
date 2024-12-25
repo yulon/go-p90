@@ -10,8 +10,7 @@ import (
 const (
 	ptUnreliableData byte = iota
 	ptData
-	ptReceiveds
-	ptRequests
+	ptGots
 	ptClose
 	ptHowAreYou
 	ptStreamData
@@ -20,8 +19,7 @@ const (
 var isReliablePT = []bool{
 	false, // ptUnreliableData
 	true,  // ptData
-	false, // ptReceiveds
-	false, // ptRequests
+	false, // ptGots
 	true,  // ptClose
 	true,  // ptHowAreYou
 	true,  // ptStreamData
@@ -29,54 +27,47 @@ var isReliablePT = []bool{
 
 var MagicNumber byte = 0x90
 
+type gotPkt struct {
+	ID         uint64
+	SendCount  byte
+	GotElapsed int64
+}
+
+type replyingCtx struct {
+	gotPkt
+	gotTm int64
+}
+
+func (rc *replyingCtx) Index() uint64 {
+	return rc.ID
+}
+
+func (rc *replyingCtx) updateGotElapsed(now int64) {
+	rc.GotElapsed = now - rc.gotTm
+}
+
 type packetHeader struct {
-	Checksum  byte
-	ConID     uuid.UUID
-	ID        uint64
-	Type      byte
-	SendTime  int64
-	SendCount byte
+	Checksum     byte
+	ConID        uuid.UUID
+	ID           uint64
+	Type         byte
+	SendCount    byte
+	GotDenseLast gotPkt
 }
 
-type receivedPacketInfo struct {
-	ID        uint64
-	SendTime  int64
-	SendCount byte
-	RecvTime  int64
-}
-
-var CalcPacketHeaderHash = func(h *packetHeader) byte {
-	var n byte
-	for _, b := range h.ConID {
-		n += b
+var CalcPacketHash = func(p []byte) (h byte) {
+	for i := 1; i < len(p); i++ {
+		h += p[i]
 	}
-	n += byte(h.ID)
-	n += byte(h.ID >> 8)
-	n += byte(h.ID >> 16)
-	n += byte(h.ID >> 24)
-	n += byte(h.ID >> 32)
-	n += byte(h.ID >> 40)
-	n += byte(h.ID >> 48)
-	n += byte(h.ID >> 56)
-	n += h.Type
-	n += byte(h.SendTime)
-	n += byte(h.SendTime >> 8)
-	n += byte(h.SendTime >> 16)
-	n += byte(h.SendTime >> 24)
-	n += byte(h.SendTime >> 32)
-	n += byte(h.SendTime >> 40)
-	n += byte(h.SendTime >> 48)
-	n += byte(h.SendTime >> 56)
-	n += h.SendCount
-	return n
+	return
 }
 
-var PacketHeaderIsValid = func(h *packetHeader) bool {
-	return CalcPacketHeaderHash(h)+h.Checksum == MagicNumber
+var PacketIsValid = func(p []byte) bool {
+	return p[0]+CalcPacketHash(p) == MagicNumber
 }
 
-var CalcPacketHeaderChecksum = func(h *packetHeader) byte {
-	return MagicNumber - CalcPacketHeaderHash(h)
+var CalcPacketChecksum = func(p []byte) byte {
+	return MagicNumber - CalcPacketHash(p)
 }
 
 const DefaultRTT = 266 * time.Millisecond

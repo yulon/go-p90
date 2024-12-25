@@ -99,13 +99,13 @@ func (srb *streamReadBuffer) Put(ix uint64, pkt []byte) {
 
 	if srb.buf == nil {
 		srb.buf = bytes.NewBuffer(nil)
-		srb.sor = newSorter(func(datas []*indexedData) {
+		srb.sor = newSorter(func(datas []indexer) {
 			for _, data := range datas {
-				srb.buf.Write(data.val.([]byte))
+				srb.buf.Write(data.(*indexedData).data)
 			}
 		})
 	}
-	if srb.sor.TryAdd(ix, pkt) == false {
+	if !srb.sor.TryAdd(newIndexedData(ix, pkt)) {
 		panic("duplicated index")
 	}
 }

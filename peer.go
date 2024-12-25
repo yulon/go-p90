@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -42,20 +41,21 @@ func (pr *Peer) tryRespCloseTo(addr net.Addr, h *packetHeader) bool {
 	if h.Type != ptClose {
 		return false
 	}
-	h.ID = 0
-	h.Type = ptReceiveds
-	h.SendCount = 1
-	h.SendTime = 0
-	pr.writeTo(makePacket(h, uint64(18446744073709551615)), addr)
+	h.Type = ptClose
+	pr.writeTo(makePacket(h), addr)
 	return true
 }
 
 func (pr *Peer) bypassRecv(from net.Addr, to net.PacketConn, h *packetHeader, p []byte) {
+	if !PacketIsValid(p) {
+		return
+	}
+
 	r := bytes.NewBuffer(nil)
 	r.Write(p)
 	err := binary.Read(r, binary.LittleEndian, h)
 
-	if err != nil || !PacketHeaderIsValid(h) || int(h.Type) >= len(isReliablePT) {
+	if err != nil || int(h.Type) >= len(isReliablePT) {
 		return
 	}
 
@@ -101,22 +101,6 @@ func listen(pktCon net.PacketConn, isUnique bool) (*Peer, error) {
 				return
 			}
 			pr.bypassRecv(addr, pr.locLnr, &h, b[:sz])
-		}
-	}()
-	go func() {
-		for {
-			dur := 90 * time.Second
-
-			pr.conMap.Range(func(_, v interface{}) bool {
-				con := v.(*Conn)
-				d := con.handleRTO()
-				if d > 0 && d < dur {
-					dur = d
-				}
-				return true
-			})
-
-			time.Sleep(dur)
 		}
 	}()
 	return pr, nil

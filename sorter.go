@@ -4,147 +4,149 @@ import (
 	"container/list"
 )
 
-type indexedData struct {
-	ix  uint64
-	val interface{}
-}
-
-func newIndexedData(ix uint64, val interface{}) *indexedData {
-	switch val.(type) {
-	case []byte:
-		dataSrc := val.([]byte)
-		dataCpy := make([]byte, len(dataSrc))
-		copy(dataCpy, dataSrc)
-		return &indexedData{ix, dataCpy}
-	}
-	return &indexedData{ix, val}
+type indexer interface {
+	Index() uint64
 }
 
 type sorter struct {
-	continuousLastIx uint64
-	discretes        *list.List
-	onMerge          func([]*indexedData)
+	denseLast indexer
+	nondense  *list.List
+	onDense   func([]indexer)
 }
 
-func newSorter(onMerge func([]*indexedData)) *sorter {
-	return &sorter{onMerge: onMerge, discretes: list.New()}
+func newSorter(onDense func([]indexer)) *sorter {
+	return &sorter{nondense: list.New(), onDense: onDense}
 }
 
-func (str *sorter) TryAdd(ix uint64, val interface{}) bool {
-	if ix <= str.continuousLastIx {
+func (s *sorter) TryAdd(val indexer) bool {
+	if s.denseLast != nil && val.Index() <= s.denseLast.Index() {
 		return false
 	}
 
 	isInst := false
-	for it := str.discretes.Front(); it != nil; it = it.Next() {
-		data := it.Value.(*indexedData)
-		if ix == data.ix {
+	for it := s.nondense.Front(); it != nil; it = it.Next() {
+		added := it.Value.(indexer)
+		if val.Index() == added.Index() {
 			return false
 		}
-		if ix < data.ix {
-			str.discretes.InsertBefore(newIndexedData(ix, val), it)
+		if val.Index() < added.Index() {
+			s.nondense.InsertBefore(val, it)
 			isInst = true
 			break
 		}
 	}
-	if !isInst && (str.discretes.Len() == 0 || ix > str.discretes.Back().Value.(*indexedData).ix) {
-		str.discretes.PushBack(newIndexedData(ix, val))
+	if !isInst && (s.nondense.Len() == 0 || val.Index() > s.nondense.Back().Value.(indexer).Index()) {
+		s.nondense.PushBack(val)
 	}
 
-	n := str.discretes.Len()
-	if n == 0 {
+	if s.nondense.Len() == 0 {
 		return true
 	}
-	frontIx := str.discretes.Front().Value.(*indexedData).ix
-	frontDiff := frontIx - str.continuousLastIx
-	if frontDiff > 1 {
-		return true
-	}
-	if frontDiff == 0 {
-		panic(frontDiff)
-	}
 
-	newFront := str.discretes.Front().Next()
-	c := 1
-	for ; newFront != nil; newFront = newFront.Next() {
-		data := newFront.Value.(*indexedData)
-		prevData := newFront.Prev().Value.(*indexedData)
-		if data.ix-prevData.ix > 1 {
+	var dense []indexer
+	for {
+		it := s.nondense.Front()
+		if it == nil {
 			break
 		}
-		c++
-	}
+		cur := it.Value.(indexer)
 
-	if newFront != nil {
-		str.continuousLastIx = newFront.Prev().Value.(*indexedData).ix
-	} else {
-		str.continuousLastIx = str.discretes.Back().Value.(*indexedData).ix
-	}
+		var mbi uint64
+		if s.denseLast != nil {
+			mbi = s.denseLast.Index()
+		} else {
+			mbi = 0
+		}
 
-	var merges []*indexedData
-	for it := str.discretes.Front(); it != nil; {
-		data := it.Value.(*indexedData)
-		if data.ix > str.continuousLastIx {
+		if cur.Index()-mbi > 1 {
 			break
 		}
-		if str.onMerge != nil {
-			if merges == nil {
-				merges = make([]*indexedData, 0, c)
-			}
-			merges = append(merges, data)
+
+		s.nondense.Remove(it)
+		s.denseLast = cur
+		if s.onDense != nil {
+			dense = append(dense, cur)
 		}
-		next := it.Next()
-		str.discretes.Remove(it)
-		it = next
 	}
-	if len(merges) > 0 {
-		str.onMerge(merges)
+	if len(dense) > 0 {
+		s.onDense(dense)
 	}
 	return true
 }
 
-func (str *sorter) Has(ix uint64) bool {
-	if ix <= str.continuousLastIx {
+func (s *sorter) Has(ix uint64) bool {
+	if s.denseLast != nil && ix <= s.denseLast.Index() {
 		return true
 	}
-	for it := str.discretes.Front(); it != nil; it = it.Next() {
-		data := it.Value.(*indexedData)
-		if ix == data.ix {
+	for it := s.nondense.Front(); it != nil; it = it.Next() {
+		added := it.Value.(indexer)
+		if ix == added.Index() {
 			return true
 		}
 	}
 	return false
 }
 
-func (str *sorter) Discretes() *list.List {
-	return str.discretes
+func (s *sorter) Nondense() *list.List {
+	return s.nondense
 }
 
-func (str *sorter) ContinuousLastIndex() uint64 {
-	return str.continuousLastIx
+func (s *sorter) DenseLast() indexer {
+	return s.denseLast
 }
 
-func (str *sorter) TryApplyContinuousLastIndex(ix uint64) bool {
-	if ix <= str.continuousLastIx {
+func (s *sorter) DenseLastIndex() uint64 {
+	if s.denseLast == nil {
+		return 0
+	}
+	return s.denseLast.Index()
+}
+
+func (s *sorter) TryChangeDenseLast(ixr indexer) bool {
+	if s.denseLast != nil && ixr.Index() <= s.denseLast.Index() {
 		return false
 	}
-	str.continuousLastIx = ix
+	s.denseLast = ixr
 
-	merges := make([]*indexedData, 0)
-	for it := str.discretes.Front(); it != nil; {
-		data := it.Value.(*indexedData)
-		if data.ix > ix && data.ix-ix > 1 {
-			break
+	var dense []indexer
+	for it := s.nondense.Front(); it != nil; {
+		added := it.Value.(indexer)
+		if added.Index() > ixr.Index() {
+			if added.Index()-ixr.Index() > 1 {
+				break
+			}
+			s.denseLast = added
 		}
-		if str.onMerge != nil {
-			merges = append(merges, data)
+		if s.onDense != nil {
+			dense = append(dense, added)
 		}
 		next := it.Next()
-		str.discretes.Remove(it)
+		s.nondense.Remove(it)
 		it = next
 	}
-	if len(merges) > 0 {
-		str.onMerge(merges)
+	if len(dense) > 0 {
+		s.onDense(dense)
 	}
 	return true
+}
+
+type indexed uint64
+
+func (ix indexed) Index() uint64 {
+	return uint64(ix)
+}
+
+type indexedData struct {
+	ix   uint64
+	data []byte
+}
+
+func (id *indexedData) Index() uint64 {
+	return id.ix
+}
+
+func newIndexedData(ix uint64, data []byte) indexer {
+	dataCpy := make([]byte, len(data))
+	copy(dataCpy, data)
+	return &indexedData{ix, dataCpy}
 }
