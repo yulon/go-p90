@@ -37,7 +37,6 @@ type Conn struct {
 
 	isHandshaked bool
 
-	wTimeout    atomicDur
 	idleTimeout atomicDur
 
 	rtt          atomicDur
@@ -45,14 +44,13 @@ type Conn struct {
 	minRTT       atomicDur
 	rtts         []time.Duration
 	rttSum       time.Duration
-	rttAvg       time.Duration
+	rttAvg       atomicDur
 	rttFromPktID uint64
 
 	wLastTime atomicTime
 	rLastTime atomicTime
 
-	isKeepAlived  bool
-	isWaitingFine bool
+	isKeepAlived bool
 
 	lastPktID atomic.Uint64
 
@@ -79,11 +77,10 @@ func newConn(id uuid.UUID, locPr *Peer, rmtAddr net.Addr, isKeepAlived bool) *Co
 		id:           id,
 		locPr:        locPr,
 		rmtAddr:      rmtAddr,
-		wTimeout:     newAtomicDur(30 * time.Second),
 		idleTimeout:  newAtomicDur(time.Minute),
 		rtt:          newAtomicDur(DefaultRTT),
 		minRTT:       newAtomicDur(DefaultRTT),
-		rttAvg:       DefaultRTT,
+		rttAvg:       newAtomicDur(DefaultRTT),
 		rLastTime:    newAtomicTime(now),
 		wLastTime:    newAtomicTime(now),
 		isKeepAlived: isKeepAlived,
@@ -106,8 +103,6 @@ func (con *Conn) opErr(op string, srcErr error) error {
 	return &net.OpError{Op: op, Net: "p90", Source: con.LocalAddr(), Addr: con.RemoteAddr(), Err: srcErr}
 }
 
-var errWasClosed = errors.New("was closed")
-var errClosingByLocal = errors.New("closing by local")
 var errClosedByLocal = errors.New("closed by local")
 var errClosedByRemote = errors.New("closed by remote")
 
@@ -170,14 +165,12 @@ type recvPkt struct {
 	body *bytes.Buffer
 }
 
-func (con *Conn) handleRecv(cWnd *list.List, sents *sorter, lstRepMoreTm *int64, rp *recvPkt) (fstRecv bool, unsendN int64, err error) {
+func (con *Conn) handleRecv(cWnd *list.List, sents *sorter, lstRepMoreTm *int64, rp *recvPkt) (fstRecv bool, sentN int64, err error) {
 	now := time.Now().UnixMilli()
 
 	con.rLastTime.Set(time.Now())
 
-	if con.isHandshaked {
-		con.isWaitingFine = false
-	} else {
+	if !con.isHandshaked {
 		con.isHandshaked = true
 		fstRecv = true
 	}
@@ -303,7 +296,7 @@ func (con *Conn) handleRecv(cWnd *list.List, sents *sorter, lstRepMoreTm *int64,
 		con.rStrmBuf.Put(strmPktIx, rp.body.Bytes())
 	}
 
-	unsendN = con.unsends(cWnd, sents, now, &rp.h.GotDenseLast, rmtGotNondense)
+	sentN = con.sents(cWnd, sents, now, &rp.h.GotDenseLast, rmtGotNondense)
 
 	return
 }
@@ -363,15 +356,21 @@ func (con *Conn) checkAlive() (time.Duration, error) {
 	}
 
 	rem := ito - dur
-	if rem > 0 {
-		/*if con.isKeepAlived && rem < ito/2 && con.isHandshaked && !con.isWaitingFine && con.state.Load() == csNormal {
-			con.isWaitingFine = true
-			con.sendOnce(ptHowAreYou)
-		}*/
+	if rem <= 0 {
+		return -1, errRecvTimeout
+	}
+
+	if !con.isHandshaked || con.state.Load() != csNormal || !con.isKeepAlived {
 		return rem, nil
 	}
 
-	return -1, errRecvTimeout
+	wto := con.wTimeout(ito)
+	rem -= wto
+	if rem > 0 {
+		return rem, nil
+	}
+	con.sendOnce(ptHowAreYou)
+	return -1, nil
 }
 
 var errResendMaximum = errors.New("send count has been maximum")
@@ -469,7 +468,7 @@ func (con *Conn) resends(cWnd *list.List) (time.Duration, error) {
 		if len(sc.wTimes) == 0 {
 			panic(sc)
 		}
-		if now.Sub(sc.wTimes[0]) > con.wTimeout.Get() {
+		if now.Sub(sc.wTimes[0]) > con.GetWriteTimeout() {
 			if !con.isHandshaked {
 				return -1, errHandshakingTimeout
 			}
@@ -551,18 +550,21 @@ func (con *Conn) handleIO() {
 		}
 
 		if rp != nil {
-			fstRecv, unsendN, err := con.handleRecv(cWnd, sents, &lstRepMoreTm, rp)
+			_, sentN, err := con.handleRecv(cWnd, sents, &lstRepMoreTm, rp)
 			if err != nil {
 				con.close(err)
 				continue
 			}
-			if fstRecv {
-				ito := con.idleTimeout.Get()
-				if ito > 0 {
-					checkAliveTk.Reset(ito)
+
+			ito := con.idleTimeout.Get()
+			if ito > 0 {
+				if con.isKeepAlived {
+					ito -= con.wTimeout(ito)
 				}
+				checkAliveTk.Reset(ito)
 			}
-			if unsendN == 0 {
+
+			if sentN == 0 {
 				continue
 			}
 			//cWndSize -= popSz
@@ -655,11 +657,11 @@ func (con *Conn) updateRTInfo(fromPktID uint64, rtt time.Duration, wCount uintpt
 		con.rtts[9] = rtt
 	}
 	con.rttSum += rtt
-	con.rttAvg = con.rttSum / time.Duration(len(con.rtts))
+	con.rttAvg.Set(con.rttSum / time.Duration(len(con.rtts)))
 }
 
-func (con *Conn) unsends(cWnd *list.List, sents *sorter, now int64, denseLast *gotPkt, nondense []gotPkt) int64 {
-	unsendN := int64(0)
+func (con *Conn) sents(cWnd *list.List, sents *sorter, now int64, denseLast *gotPkt, nondense []gotPkt) int64 {
+	sentN := int64(0)
 
 	var lstGP *gotPkt
 	var lstSC *sendingCtx
@@ -671,7 +673,7 @@ func (con *Conn) unsends(cWnd *list.List, sents *sorter, now int64, denseLast *g
 				break
 			}
 
-			unsendN++
+			sentN++
 
 			next := it.Next()
 			cWnd.Remove(it)
@@ -704,11 +706,11 @@ func (con *Conn) unsends(cWnd *list.List, sents *sorter, now int64, denseLast *g
 			}
 
 			wt := time.Duration(now-sc.wTimes[0].UnixMilli()*2) * time.Millisecond
-			if wt > con.wTimeout.Get() {
-				con.wTimeout.Set(wt)
+			if wt > con.GetWriteTimeout() {
+				con.SetWriteTimeout(wt)
 			}
 
-			unsendN++
+			sentN++
 
 			cWnd.Remove(it)
 			break
@@ -719,7 +721,7 @@ func (con *Conn) unsends(cWnd *list.List, sents *sorter, now int64, denseLast *g
 		con.updateRTInfo(lstGP.ID, time.Duration(now-lstSC.wTimes[lstGP.SendCount-1].UnixMilli()-lstGP.GotElapsed)*time.Millisecond, uintptr(lstGP.SendCount))
 	}
 
-	return unsendN
+	return sentN
 }
 
 func (con *Conn) WritePacketOnce(data []byte) (int, error) {
@@ -818,34 +820,24 @@ func (con *Conn) LastActivityTime() time.Time {
 	return st
 }
 
-func (con *Conn) SetReadTimeout(dur time.Duration) error {
-	err := con.checkErr()
-	if err != nil {
-		return con.opErr("SetReadTimeout", err)
-	}
-
-	// con.rTimeout.Set(dur)
-	return nil
-}
-
-func (con *Conn) SetWriteTimeout(dur time.Duration) error {
-	err := con.checkErr()
-	if err != nil {
-		return con.opErr("SetWriteTimeout", err)
-	}
-
-	con.wTimeout.Set(dur)
-	return nil
-}
-
-func (con *Conn) SetIdleTimeout(dur time.Duration) error {
-	err := con.checkErr()
-	if err != nil {
-		return con.opErr("SetIdleTimeout", err)
-	}
-
+func (con *Conn) SetIdleTimeout(dur time.Duration) {
 	con.idleTimeout.Set(dur)
-	return nil
+}
+
+func (con *Conn) GetIdleTimeout() time.Duration {
+	return con.idleTimeout.Get()
+}
+
+func (con *Conn) SetWriteTimeout(dur time.Duration) {
+	con.idleTimeout.Set((dur*2 - con.rttAvg.Get()) * 2)
+}
+
+func (con *Conn) wTimeout(ito time.Duration) time.Duration {
+	return (ito/2 + con.rttAvg.Get()) / 2
+}
+
+func (con *Conn) GetWriteTimeout() time.Duration {
+	return con.wTimeout(con.idleTimeout.Get())
 }
 
 func (con *Conn) SetReadDeadline(t time.Time) error {
@@ -853,12 +845,7 @@ func (con *Conn) SetReadDeadline(t time.Time) error {
 	if err != nil {
 		return con.opErr("SetReadDeadline", err)
 	}
-
-	if t.IsZero() {
-		//con.rTimeout.Set(0)
-		return nil
-	}
-	//con.rTimeout.Set(t.Sub(time.Now()))
+	// TODO
 	return nil
 }
 
@@ -867,12 +854,7 @@ func (con *Conn) SetWriteDeadline(t time.Time) error {
 	if err != nil {
 		return con.opErr("SetWriteDeadline", err)
 	}
-
-	if t.IsZero() {
-		con.wTimeout.Set(0)
-		return nil
-	}
-	con.wTimeout.Set(t.Sub(time.Now()))
+	// TODO
 	return nil
 }
 
@@ -881,15 +863,7 @@ func (con *Conn) SetDeadline(t time.Time) error {
 	if err != nil {
 		return con.opErr("SetDeadline", err)
 	}
-
-	if t.IsZero() {
-		con.wTimeout.Set(0)
-		//con.rTimeout.Set(0)
-		return nil
-	}
-	dur := t.Sub(time.Now())
-	con.wTimeout.Set(dur)
-	//con.rTimeout.Set(dur)
+	// TODO
 	return nil
 }
 
